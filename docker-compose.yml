@@ -1,0 +1,34 @@
+services:
+
+  minio:
+    image: quay.io/minio/minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console
+    volumes:
+      - ${HOME}/minio/data:/data
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+
+  backend:
+    build: .
+    ports:
+      - "3425:3425"
+    env_file: .env
+    environment:
+      # Override so the container talks to MinIO over the Docker network,
+      # not through the public hostname.
+      MINIO_ENDPOINT_URL: http://minio:9000
+    depends_on:
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
