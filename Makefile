@@ -1,13 +1,23 @@
-PORT ?= 46696
+up:
+	docker compose up -d
 
-run:
-	source venv/bin/activate && python manage.py runserver 0.0.0.0:$(PORT)
+down:
+	docker compose down
+
+logs:
+	docker compose logs -f backend
+
+seed:
+	docker compose exec backend python manage.py seed_test_users
+
+unseed:
+	docker compose exec backend python manage.py seed_test_users --clear
 
 migrate:
-	source venv/bin/activate && python manage.py migrate
+	docker compose exec backend python manage.py migrate
 
 migrations:
-	source venv/bin/activate && python manage.py makemigrations
+	docker compose exec backend python manage.py makemigrations
 
 shell:
-	source venv/bin/activate && python manage.py shell
+	docker compose exec backend python manage.py shell

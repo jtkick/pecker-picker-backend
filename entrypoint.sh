@@ -22,6 +22,9 @@ done
 echo "Running migrations..."
 python manage.py migrate --noinput
 
+echo "Collecting static files..."
+python manage.py collectstatic --noinput
+
 echo "Ensuring bucket exists and is public..."
 python - <<'EOF'
 import boto3, json, os

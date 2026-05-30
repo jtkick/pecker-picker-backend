@@ -21,12 +21,14 @@ INSTALLED_APPS = [
     "django.contrib.messages",
     "django.contrib.staticfiles",
     "rest_framework",
+    "rest_framework_simplejwt.token_blacklist",
     "corsheaders",
     "api",
 ]
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "corsheaders.middleware.CorsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
@@ -106,9 +108,17 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 
 STATIC_URL = "static/"
+STATIC_ROOT = BASE_DIR / "staticfiles"
 
 MAX_UPLOAD_SIZE_MB = 10
 MAX_GALLERY_IMAGES = 6
+
+# ── AWS Rekognition (image auto-tagging) ─────────────────────────────────────
+# Leave AWS_REKOGNITION_REGION blank to disable auto-tagging (dev / no-AWS).
+# Rekognition uses its own credentials so the MinIO keys are not sent to AWS.
+AWS_REKOGNITION_REGION           = os.environ.get("AWS_REKOGNITION_REGION", "")
+AWS_REKOGNITION_ACCESS_KEY_ID    = os.environ.get("AWS_REKOGNITION_ACCESS_KEY_ID", "")
+AWS_REKOGNITION_SECRET_ACCESS_KEY = os.environ.get("AWS_REKOGNITION_SECRET_ACCESS_KEY", "")
 
 # ── Object storage (MinIO locally, S3 in production) ─────────────────────────
 # Internal endpoint — used by boto3 for API calls from the Django process.
@@ -130,7 +140,7 @@ STORAGES = {
         "BACKEND": "api.storage.MediaStorage",
     },
     "staticfiles": {
-        "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",
+        "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
     },
 }
 
@@ -151,7 +161,7 @@ SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(minutes=60),
     "REFRESH_TOKEN_LIFETIME": timedelta(days=30),
     "ROTATE_REFRESH_TOKENS": True,
-    "BLACKLIST_AFTER_ROTATION": False,
+    "BLACKLIST_AFTER_ROTATION": True,
 }
 
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
@@ -160,3 +170,14 @@ TWILIO_PHONE_NUMBER = os.environ.get("TWILIO_PHONE_NUMBER", "")
 TWILIO_ENABLED = bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_PHONE_NUMBER)
 
 OTP_EXPIRY_MINUTES = 10
+
+# ── Stripe ────────────────────────────────────────────────────────────────────
+STRIPE_SECRET_KEY      = os.environ.get("STRIPE_SECRET_KEY", "")
+STRIPE_WEBHOOK_SECRET  = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+# Map tier level → Stripe Price ID (recurring).  Add more entries for new tiers.
+STRIPE_TIER_PRICES = {
+    1: os.environ.get("STRIPE_PRICE_TIER1", ""),
+}
+# Where Stripe redirects after checkout or portal.
+STRIPE_SUCCESS_URL = os.environ.get("STRIPE_SUCCESS_URL", "https://triangulum.cc/subscription/success")
+STRIPE_CANCEL_URL  = os.environ.get("STRIPE_CANCEL_URL",  "https://triangulum.cc/subscription/cancel")
