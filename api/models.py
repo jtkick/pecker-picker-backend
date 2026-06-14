@@ -4,9 +4,7 @@ from django.utils import timezone
 
 
 class UserManager(BaseUserManager):
-    def create_user(self, phone_number, **extra_fields):
-        if not phone_number:
-            raise ValueError("Phone number is required")
+    def create_user(self, phone_number=None, **extra_fields):
         user = self.model(phone_number=phone_number, **extra_fields)
         user.set_unusable_password()
         user.save(using=self._db)
@@ -23,7 +21,7 @@ class UserManager(BaseUserManager):
 
 
 class User(AbstractBaseUser, PermissionsMixin):
-    phone_number = models.CharField(max_length=20, unique=True)
+    phone_number = models.CharField(max_length=20, unique=True, null=True, blank=True)
     date_joined = models.DateTimeField(default=timezone.now)
     is_active = models.BooleanField(default=True)
     is_staff = models.BooleanField(default=False)
@@ -98,7 +96,7 @@ class User(AbstractBaseUser, PermissionsMixin):
     objects = UserManager()
 
     def __str__(self):
-        return self.phone_number
+        return self.phone_number or f'User {self.pk}'
 
 
 class ProfileImage(models.Model):
@@ -300,3 +298,27 @@ class OTPVerification(models.Model):
 
     def is_valid(self):
         return not self.is_used and timezone.now() < self.expires_at
+
+
+class PasskeyCredential(models.Model):
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='passkey_credentials')
+    credential_id = models.BinaryField(unique=True)
+    public_key = models.BinaryField()
+    sign_count = models.PositiveBigIntegerField(default=0)
+    transports = models.JSONField(default=list)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f'Passkey for {self.user}'
+
+
+class WebAuthnChallenge(models.Model):
+    session_id = models.UUIDField(unique=True)
+    challenge = models.CharField(max_length=256)
+    action = models.CharField(max_length=20)  # 'register' | 'authenticate'
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    is_used = models.BooleanField(default=False)
+
+    def is_expired(self):
+        return timezone.now() > self.expires_at

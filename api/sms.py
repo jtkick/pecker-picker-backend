@@ -12,8 +12,9 @@ def send_otp_sms(phone_number: str, code: str) -> None:
     from twilio.rest import Client
 
     client = Client(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN)
-    client.messages.create(
+    msg = client.messages.create(
         body=f"Your Pecker Picker code is {code}. Valid for {settings.OTP_EXPIRY_MINUTES} minutes.",
         from_=settings.TWILIO_PHONE_NUMBER,
         to=phone_number,
     )
+    logger.info("SMS queued to %s — SID: %s status: %s", phone_number, msg.sid, msg.status)

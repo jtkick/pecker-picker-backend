@@ -4,8 +4,10 @@ from . import views, stripe_views
 
 urlpatterns = [
     path("health/", views.health_check, name="health-check"),
-    path("auth/request-otp/", views.request_otp, name="request-otp"),
-    path("auth/verify-otp/", views.verify_otp, name="verify-otp"),
+    path("auth/passkey/register/begin/", views.passkey_register_begin, name="passkey-register-begin"),
+    path("auth/passkey/register/complete/", views.passkey_register_complete, name="passkey-register-complete"),
+    path("auth/passkey/authenticate/begin/", views.passkey_authenticate_begin, name="passkey-authenticate-begin"),
+    path("auth/passkey/authenticate/complete/", views.passkey_authenticate_complete, name="passkey-authenticate-complete"),
     path("auth/token/refresh/", TokenRefreshView.as_view(), name="token-refresh"),
     path("auth/logout/", views.logout, name="logout"),
     path("me/", views.me, name="me"),

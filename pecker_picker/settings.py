@@ -171,6 +171,13 @@ TWILIO_ENABLED = bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_PHONE_
 
 OTP_EXPIRY_MINUTES = 10
 
+# ── WebAuthn / Passkeys ───────────────────────────────────────────────────────
+WEBAUTHN_RP_ID = os.environ.get("WEBAUTHN_RP_ID", "triangulum.cc")
+WEBAUTHN_RP_NAME = os.environ.get("WEBAUTHN_RP_NAME", "Pecker Picker")
+WEBAUTHN_ORIGINS = os.environ.get("WEBAUTHN_ORIGINS", "https://triangulum.cc").split(",")
+# Run: keytool -list -v -keystore your-release.jks  to get this value
+ANDROID_SHA256_CERT_FINGERPRINT = os.environ.get("ANDROID_SHA256_CERT_FINGERPRINT", "PLACEHOLDER")
+
 # ── Stripe ────────────────────────────────────────────────────────────────────
 STRIPE_SECRET_KEY      = os.environ.get("STRIPE_SECRET_KEY", "")
 STRIPE_WEBHOOK_SECRET  = os.environ.get("STRIPE_WEBHOOK_SECRET", "")

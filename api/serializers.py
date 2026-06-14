@@ -69,26 +69,6 @@ def _viewer_filter(user, viewer) -> Q | None:
     return q
 
 
-class RequestOTPSerializer(serializers.Serializer):
-    phone_number = serializers.CharField()
-
-    def validate_phone_number(self, value):
-        return normalize_phone(value)
-
-
-class VerifyOTPSerializer(serializers.Serializer):
-    phone_number = serializers.CharField()
-    code = serializers.CharField(min_length=6, max_length=6)
-
-    def validate_phone_number(self, value):
-        return normalize_phone(value)
-
-    def validate_code(self, value):
-        if not value.isdigit():
-            raise serializers.ValidationError("OTP must be 6 digits.")
-        return value
-
-
 class GalleryImageSerializer(serializers.ModelSerializer):
     url = serializers.SerializerMethodField()
     tags = serializers.SerializerMethodField()

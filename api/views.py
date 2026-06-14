@@ -1,7 +1,10 @@
-import random
-import string
+import json
+import logging
 import threading
+import uuid
 from datetime import timedelta
+
+logger = logging.getLogger(__name__)
 
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -13,20 +16,30 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from django.db.models import Prefetch
 
 from rest_framework_simplejwt.exceptions import TokenError
-from .models import OTPVerification, User, ProfileImage, Conversation, Message, ImageShareGrant, LocationShareGrant, Block, Report, FaceVerification, Kink, Interest
+from webauthn import (
+    generate_registration_options,
+    verify_registration_response,
+    generate_authentication_options,
+    verify_authentication_response,
+    options_to_json,
+    base64url_to_bytes,
+)
+from webauthn.helpers.structs import (
+    AuthenticatorSelectionCriteria,
+    AuthenticatorAttachment,
+    ResidentKeyRequirement,
+    UserVerificationRequirement,
+    AttestationConveyancePreference,
+)
+from .models import User, ProfileImage, Conversation, Message, ImageShareGrant, LocationShareGrant, Block, Report, FaceVerification, Kink, Interest, PasskeyCredential, WebAuthnChallenge
 from .serializers import (
-    RequestOTPSerializer, VerifyOTPSerializer, ProfileSerializer,
+    ProfileSerializer,
     GalleryImageSerializer, DiscoverUserSerializer, UserProfileSerializer,
     ImageShareGrantSerializer, LocationShareGrantSerializer, ConversationSerializer, MessageSerializer,
 )
 from .geocoding import reverse_geocode, nearby_label
-from .sms import send_otp_sms
 from .tagging import auto_tag
 from django.conf import settings
-
-
-def _generate_otp() -> str:
-    return "".join(random.choices(string.digits, k=6))
 
 
 @api_view(["GET"])
@@ -37,60 +50,171 @@ def health_check(request):
 
 @api_view(["POST"])
 @permission_classes([AllowAny])
-def request_otp(request):
-    serializer = RequestOTPSerializer(data=request.data)
-    serializer.is_valid(raise_exception=True)
-    phone_number = serializer.validated_data["phone_number"]
+def passkey_register_begin(request):
+    user_handle = uuid.uuid4().bytes
 
-    # Invalidate any pending OTPs for this number
-    OTPVerification.objects.filter(phone_number=phone_number, is_used=False).update(is_used=True)
-
-    code = _generate_otp()
-    OTPVerification.objects.create(
-        phone_number=phone_number,
-        code=code,
-        expires_at=timezone.now() + timedelta(minutes=settings.OTP_EXPIRY_MINUTES),
+    options = generate_registration_options(
+        rp_id=settings.WEBAUTHN_RP_ID,
+        rp_name=settings.WEBAUTHN_RP_NAME,
+        user_id=user_handle,
+        user_name="user",
+        user_display_name="",
+        attestation=AttestationConveyancePreference.NONE,
+        authenticator_selection=AuthenticatorSelectionCriteria(
+            authenticator_attachment=AuthenticatorAttachment.PLATFORM,
+            resident_key=ResidentKeyRequirement.REQUIRED,
+            user_verification=UserVerificationRequirement.REQUIRED,
+        ),
+        timeout=60000,
     )
 
-    send_otp_sms(phone_number, code)
+    from webauthn.helpers import bytes_to_base64url
+    session_id = uuid.uuid4()
+    WebAuthnChallenge.objects.create(
+        session_id=session_id,
+        challenge=bytes_to_base64url(options.challenge),
+        action='register',
+        expires_at=timezone.now() + timedelta(minutes=5),
+    )
 
-    return Response({"detail": "Verification code sent."}, status=status.HTTP_200_OK)
+    response_data = json.loads(options_to_json(options))
+    response_data['session_id'] = str(session_id)
+    return Response(response_data)
 
 
 @api_view(["POST"])
 @permission_classes([AllowAny])
-def verify_otp(request):
-    serializer = VerifyOTPSerializer(data=request.data)
-    serializer.is_valid(raise_exception=True)
-    phone_number = serializer.validated_data["phone_number"]
-    code = serializer.validated_data["code"]
+def passkey_register_complete(request):
+    session_id = request.data.get('session_id')
+    credential_data = request.data.get('credential')
+
+    if not session_id or not credential_data:
+        return Response({'detail': 'Missing session_id or credential.'}, status=status.HTTP_400_BAD_REQUEST)
 
     try:
-        otp = OTPVerification.objects.filter(
-            phone_number=phone_number,
-            code=code,
-            is_used=False,
-        ).latest("created_at")
-    except OTPVerification.DoesNotExist:
-        return Response({"detail": "Invalid code."}, status=status.HTTP_400_BAD_REQUEST)
+        challenge = WebAuthnChallenge.objects.get(
+            session_id=session_id, action='register', is_used=False,
+        )
+    except WebAuthnChallenge.DoesNotExist:
+        return Response({'detail': 'Invalid or expired session.'}, status=status.HTTP_400_BAD_REQUEST)
 
-    if not otp.is_valid():
-        return Response({"detail": "Code has expired."}, status=status.HTTP_400_BAD_REQUEST)
+    if challenge.is_expired():
+        return Response({'detail': 'Session expired.'}, status=status.HTTP_400_BAD_REQUEST)
 
-    otp.is_used = True
-    otp.save()
+    try:
+        verification = verify_registration_response(
+            credential=credential_data,
+            expected_challenge=base64url_to_bytes(challenge.challenge),
+            expected_rp_id=settings.WEBAUTHN_RP_ID,
+            expected_origin=settings.WEBAUTHN_ORIGINS,
+            require_user_verification=True,
+        )
+    except Exception as exc:
+        logger.warning("Passkey registration verification failed: %s", exc)
+        return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
-    user, is_new = User.objects.get_or_create(phone_number=phone_number)
+    if PasskeyCredential.objects.filter(credential_id=verification.credential_id).exists():
+        return Response({'detail': 'Credential already registered.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    challenge.is_used = True
+    challenge.save()
+
+    user = User.objects.create_user()
+    transports = (credential_data.get('response') or {}).get('transports', [])
+    PasskeyCredential.objects.create(
+        user=user,
+        credential_id=verification.credential_id,
+        public_key=verification.credential_public_key,
+        sign_count=verification.sign_count,
+        transports=transports,
+    )
 
     refresh = RefreshToken.for_user(user)
     return Response(
-        {
-            "access": str(refresh.access_token),
-            "refresh": str(refresh),
-            "is_new_user": is_new,
-        },
-        status=status.HTTP_201_CREATED if is_new else status.HTTP_200_OK,
+        {'access': str(refresh.access_token), 'refresh': str(refresh), 'is_new_user': True},
+        status=status.HTTP_201_CREATED,
     )
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def passkey_authenticate_begin(request):
+    options = generate_authentication_options(
+        rp_id=settings.WEBAUTHN_RP_ID,
+        user_verification=UserVerificationRequirement.REQUIRED,
+        timeout=60000,
+    )
+
+    from webauthn.helpers import bytes_to_base64url
+    session_id = uuid.uuid4()
+    WebAuthnChallenge.objects.create(
+        session_id=session_id,
+        challenge=bytes_to_base64url(options.challenge),
+        action='authenticate',
+        expires_at=timezone.now() + timedelta(minutes=5),
+    )
+
+    response_data = json.loads(options_to_json(options))
+    response_data['session_id'] = str(session_id)
+    return Response(response_data)
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def passkey_authenticate_complete(request):
+    session_id = request.data.get('session_id')
+    credential_data = request.data.get('credential')
+
+    if not session_id or not credential_data:
+        return Response({'detail': 'Missing session_id or credential.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        challenge = WebAuthnChallenge.objects.get(
+            session_id=session_id, action='authenticate', is_used=False,
+        )
+    except WebAuthnChallenge.DoesNotExist:
+        return Response({'detail': 'Invalid or expired session.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if challenge.is_expired():
+        return Response({'detail': 'Session expired.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    cred_id_b64 = credential_data.get('id')
+    if not cred_id_b64:
+        return Response({'detail': 'Missing credential id.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        stored = PasskeyCredential.objects.select_related('user').get(
+            credential_id=base64url_to_bytes(cred_id_b64),
+        )
+    except PasskeyCredential.DoesNotExist:
+        return Response({'detail': 'Unknown credential.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        verification = verify_authentication_response(
+            credential=credential_data,
+            expected_challenge=base64url_to_bytes(challenge.challenge),
+            expected_rp_id=settings.WEBAUTHN_RP_ID,
+            expected_origin=settings.WEBAUTHN_ORIGINS,
+            credential_public_key=bytes(stored.public_key),
+            credential_current_sign_count=stored.sign_count,
+            require_user_verification=True,
+        )
+    except Exception as exc:
+        logger.warning("Passkey authentication verification failed: %s", exc)
+        return Response({'detail': str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    challenge.is_used = True
+    challenge.save()
+
+    stored.sign_count = verification.new_sign_count
+    stored.save(update_fields=['sign_count'])
+
+    refresh = RefreshToken.for_user(stored.user)
+    return Response({
+        'access': str(refresh.access_token),
+        'refresh': str(refresh),
+        'is_new_user': False,
+    })
 
 
 @api_view(["POST"])
