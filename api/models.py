@@ -1,3 +1,4 @@
+from django.conf import settings
 from django.contrib.auth.models import AbstractBaseUser, BaseUserManager, PermissionsMixin
 from django.db import models
 from django.utils import timezone
@@ -22,49 +23,18 @@ class UserManager(BaseUserManager):
 
 class User(AbstractBaseUser, PermissionsMixin):
     phone_number = models.CharField(max_length=20, unique=True, null=True, blank=True)
+    phone_verified = models.BooleanField(default=False)
     date_joined = models.DateTimeField(default=timezone.now)
     is_active = models.BooleanField(default=True)
     is_staff = models.BooleanField(default=False)
 
-    display_name = models.CharField(max_length=50, blank=True)
-    bio = models.TextField(max_length=300, blank=True)
-    pronouns = models.CharField(max_length=20, blank=True)
-    age = models.SmallIntegerField(null=True, blank=True)
     notifications_enabled = models.BooleanField(default=True)
-
-    # 0 = Browsing, 1 = Looking
-    intent = models.SmallIntegerField(default=0)
-    looking_for_chat = models.BooleanField(default=False)
-    looking_for_cuddle = models.BooleanField(default=False)
-    looking_for_fool_around = models.BooleanField(default=False)
-    looking_for_sex = models.BooleanField(default=False)
-
-    # 0 = Off, 1 = General, 2 = Exact
-    location_sharing = models.SmallIntegerField(default=0)
-
-    share_images = models.BooleanField(default=False)
-    share_face = models.BooleanField(default=False)
-    share_torso = models.BooleanField(default=False)
-    share_explicit = models.BooleanField(default=False)
-    share_other = models.BooleanField(default=False)
-
     blur_explicit = models.BooleanField(default=False)
 
-    POSITION_CHOICES = [(0,'Bottom'),(1,'Vers Bottom'),(2,'Vers'),(3,'Vers Top'),(4,'Top')]
-    POWER_POSITION_CHOICES = [(0,'Sub'),(1,'Sub Switch'),(2,'Switch'),(3,'Dom Switch'),(4,'Dom')]
-
-    position       = models.SmallIntegerField(null=True, blank=True, choices=POSITION_CHOICES)
-    power_position = models.SmallIntegerField(null=True, blank=True, choices=POWER_POSITION_CHOICES)
-
-    height = models.SmallIntegerField(null=True, blank=True)   # cm
-    length = models.SmallIntegerField(null=True, blank=True)   # tenths of an inch, 0–120
-    kinks  = models.JSONField(default=list, blank=True)        # list of strings
-    share_kinks = models.BooleanField(default=False)
-    interests = models.JSONField(default=list, blank=True)          # list of strings
-    relationship_types = models.JSONField(default=list, blank=True)  # list of strings
-
-    can_host = models.BooleanField(default=False)
-    can_travel = models.BooleanField(default=False)
+    # The persona currently visible in discover and used for messaging.
+    active_persona = models.ForeignKey(
+        'Persona', null=True, blank=True, on_delete=models.SET_NULL, related_name='+',
+    )
 
     latitude = models.FloatField(null=True, blank=True)
     longitude = models.FloatField(null=True, blank=True)
@@ -90,6 +60,43 @@ class User(AbstractBaseUser, PermissionsMixin):
             return False
         return True
 
+    def _tier_limit(self, limits: dict) -> int:
+        return limits[self.TIER_PLUS if self.has_tier(self.TIER_PLUS) else self.TIER_FREE]
+
+    def persona_limit(self) -> int:
+        return self._tier_limit(settings.PERSONA_LIMITS)
+
+    def library_limit(self) -> int:
+        return self._tier_limit(settings.LIBRARY_LIMITS)
+
+    def unlocked_persona_ids(self) -> set[int]:
+        """
+        Personas usable under the current tier. Over the limit (e.g. after a
+        downgrade) the primary plus the most recently used ones stay unlocked.
+        """
+        personas = list(self.personas.all())
+        limit = self.persona_limit()
+        if len(personas) <= limit:
+            return {p.pk for p in personas}
+        primary = [p for p in personas if p.is_primary]
+        others = sorted(
+            (p for p in personas if not p.is_primary),
+            key=lambda p: (p.pk == self.active_persona_id, p.last_active_at or p.created_at),
+            reverse=True,
+        )
+        return {p.pk for p in (primary + others)[:limit]}
+
+    def get_active_persona(self) -> 'Persona':
+        """Return the active persona, creating/assigning the primary one if needed."""
+        persona = self.active_persona
+        if persona is None:
+            persona = self.personas.filter(is_primary=True).first()
+            if persona is None:
+                persona = Persona.objects.create(user=self, is_primary=True)
+            User.objects.filter(pk=self.pk).update(active_persona=persona)
+            self.active_persona = persona
+        return persona
+
     USERNAME_FIELD = "phone_number"
     REQUIRED_FIELDS = []
 
@@ -97,6 +104,61 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     def __str__(self):
         return self.phone_number or f'User {self.pk}'
+
+
+class Persona(models.Model):
+    """One of a user's profiles. Only the user's active persona appears in discover."""
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='personas')
+    is_primary = models.BooleanField(default=False)
+    sort_order = models.SmallIntegerField(default=0)
+    color = models.SmallIntegerField(default=0)   # index into the client's persona palette
+    created_at = models.DateTimeField(auto_now_add=True)
+    last_active_at = models.DateTimeField(null=True, blank=True)
+
+    display_name = models.CharField(max_length=50, blank=True)
+    bio = models.TextField(max_length=300, blank=True)
+    pronouns = models.CharField(max_length=20, blank=True)
+    age = models.SmallIntegerField(null=True, blank=True)
+
+    # 0 = Browsing, 1 = Looking
+    intent = models.SmallIntegerField(default=0)
+    looking_for_chat = models.BooleanField(default=False)
+    looking_for_cuddle = models.BooleanField(default=False)
+    looking_for_fool_around = models.BooleanField(default=False)
+    looking_for_sex = models.BooleanField(default=False)
+
+    # 0 = Off, 1 = General, 2 = Exact
+    location_sharing = models.SmallIntegerField(default=0)
+
+    POSITION_CHOICES = [(0,'Bottom'),(1,'Vers Bottom'),(2,'Vers'),(3,'Vers Top'),(4,'Top')]
+    POWER_POSITION_CHOICES = [(0,'Sub'),(1,'Sub Switch'),(2,'Switch'),(3,'Dom Switch'),(4,'Dom')]
+
+    position       = models.SmallIntegerField(null=True, blank=True, choices=POSITION_CHOICES)
+    power_position = models.SmallIntegerField(null=True, blank=True, choices=POWER_POSITION_CHOICES)
+
+    height = models.SmallIntegerField(null=True, blank=True)   # cm
+    length = models.SmallIntegerField(null=True, blank=True)   # tenths of an inch, 0–120
+    kinks  = models.JSONField(default=list, blank=True)        # list of strings
+    share_kinks = models.BooleanField(default=False)
+    interests = models.JSONField(default=list, blank=True)          # list of strings
+    relationship_types = models.JSONField(default=list, blank=True)  # list of strings
+
+    can_host = models.BooleanField(default=False)
+    can_travel = models.BooleanField(default=False)
+
+    # Fields copied by "duplicate"; everything a user edits on a profile.
+    PROFILE_FIELDS = [
+        'display_name', 'bio', 'pronouns', 'age', 'intent',
+        'looking_for_chat', 'looking_for_cuddle', 'looking_for_fool_around', 'looking_for_sex',
+        'location_sharing', 'position', 'power_position', 'height', 'length',
+        'kinks', 'share_kinks', 'interests', 'relationship_types', 'can_host', 'can_travel',
+    ]
+
+    class Meta:
+        ordering = ['sort_order', 'created_at']
+
+    def __str__(self):
+        return self.display_name or f'Persona {self.pk}'
 
 
 class ProfileImage(models.Model):
@@ -108,6 +170,7 @@ class ProfileImage(models.Model):
     tag_explicit = models.BooleanField(default=False)
     tag_other    = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
+    albums = models.ManyToManyField('Album', related_name='images', blank=True)
 
     @property
     def tags(self) -> list[str]:
@@ -122,21 +185,36 @@ class ProfileImage(models.Model):
         ordering = ['order', 'created_at']
 
 
-class ImageShareGrant(models.Model):
-    CATEGORY_CHOICES = [
-        ('face', 'Face'),
-        ('torso', 'Torso'),
-        ('explicit', 'Explicit'),
-        ('other', 'Other'),
-    ]
-    grantor = models.ForeignKey(User, on_delete=models.CASCADE, related_name='image_grants_given')
-    grantee = models.ForeignKey(User, on_delete=models.CASCADE, related_name='image_grants_received')
-    category = models.CharField(max_length=10, choices=CATEGORY_CHOICES)
+class PersonaPhoto(models.Model):
+    """A library image shown publicly on a persona, in display order."""
+    persona = models.ForeignKey(Persona, on_delete=models.CASCADE, related_name='photos')
+    image = models.ForeignKey(ProfileImage, on_delete=models.CASCADE, related_name='persona_photos')
+    order = models.SmallIntegerField(default=0)
+
+    class Meta:
+        ordering = ['order']
+        unique_together = [('persona', 'image')]
+
+
+class Album(models.Model):
+    """A named, account-wide collection of library images that can be shared privately."""
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='albums')
+    name = models.CharField(max_length=50)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['created_at']
+
+
+class AlbumGrant(models.Model):
+    grantor = models.ForeignKey(Persona, on_delete=models.CASCADE, related_name='album_grants_given')
+    grantee = models.ForeignKey(Persona, on_delete=models.CASCADE, related_name='album_grants_received')
+    album = models.ForeignKey(Album, on_delete=models.CASCADE, related_name='grants')
     expires_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        unique_together = [('grantor', 'grantee', 'category')]
+        unique_together = [('grantor', 'grantee', 'album')]
 
     def is_active(self):
         return self.expires_at is None or timezone.now() < self.expires_at
@@ -144,8 +222,8 @@ class ImageShareGrant(models.Model):
 
 class LocationShareGrant(models.Model):
     LEVEL_CHOICES = [(1, 'General'), (2, 'Exact')]
-    grantor = models.ForeignKey(User, on_delete=models.CASCADE, related_name='location_grants_given')
-    grantee = models.ForeignKey(User, on_delete=models.CASCADE, related_name='location_grants_received')
+    grantor = models.ForeignKey(Persona, on_delete=models.CASCADE, related_name='location_grants_given')
+    grantee = models.ForeignKey(Persona, on_delete=models.CASCADE, related_name='location_grants_received')
     level = models.SmallIntegerField(choices=LEVEL_CHOICES, default=2)
     expires_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -158,7 +236,7 @@ class LocationShareGrant(models.Model):
 
 
 class Conversation(models.Model):
-    participants = models.ManyToManyField(User, related_name='conversations')
+    participants = models.ManyToManyField(Persona, related_name='conversations')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(default=timezone.now)
 
@@ -171,7 +249,7 @@ class Message(models.Model):
         Conversation, on_delete=models.CASCADE, related_name='messages'
     )
     sender = models.ForeignKey(
-        User, on_delete=models.CASCADE, related_name='sent_messages'
+        Persona, on_delete=models.CASCADE, related_name='sent_messages'
     )
     body = models.TextField(max_length=2000)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -184,6 +262,8 @@ class Message(models.Model):
 class Block(models.Model):
     blocker = models.ForeignKey(User, on_delete=models.CASCADE, related_name='blocks_given')
     blocked = models.ForeignKey(User, on_delete=models.CASCADE, related_name='blocks_received')
+    # The persona the block was made from, shown in the blocked list. Blocks apply account-wide.
+    blocked_persona = models.ForeignKey(Persona, null=True, blank=True, on_delete=models.SET_NULL, related_name='+')
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -200,6 +280,7 @@ class Report(models.Model):
     ]
     reporter = models.ForeignKey(User, on_delete=models.CASCADE, related_name='reports_given')
     reported = models.ForeignKey(User, on_delete=models.CASCADE, related_name='reports_received')
+    reported_persona = models.ForeignKey(Persona, null=True, blank=True, on_delete=models.SET_NULL, related_name='+')
     reason = models.CharField(max_length=20, choices=REASON_CHOICES)
     details = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)

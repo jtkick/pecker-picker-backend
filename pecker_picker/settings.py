@@ -111,7 +111,11 @@ STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 
 MAX_UPLOAD_SIZE_MB = 10
-MAX_GALLERY_IMAGES = 6
+MAX_GALLERY_IMAGES = 6   # public photos per persona
+
+# Keyed by User.TIER_* (0 = Free, 1 = Plus).
+PERSONA_LIMITS = {0: 2, 1: 12}
+LIBRARY_LIMITS = {0: 30, 1: 200}
 
 # ── AWS Rekognition (image auto-tagging) ─────────────────────────────────────
 # Leave AWS_REKOGNITION_REGION blank to disable auto-tagging (dev / no-AWS).
@@ -164,10 +168,25 @@ SIMPLE_JWT = {
     "BLACKLIST_AFTER_ROTATION": True,
 }
 
+LOGGING = {
+    'version': 1,
+    'disable_existing_loggers': False,
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
+        },
+    },
+    'root': {
+        'handlers': ['console'],
+        'level': 'WARNING',
+    },
+}
+
 TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID", "")
 TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN", "")
 TWILIO_PHONE_NUMBER = os.environ.get("TWILIO_PHONE_NUMBER", "")
-TWILIO_ENABLED = bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_PHONE_NUMBER)
+TWILIO_VERIFY_SERVICE_SID = os.environ.get("TWILIO_VERIFY_SERVICE_SID", "")
+TWILIO_ENABLED = bool(TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_VERIFY_SERVICE_SID)
 
 OTP_EXPIRY_MINUTES = 10
 

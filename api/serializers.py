@@ -3,7 +3,7 @@ import phonenumbers
 from django.db.models import Q
 from django.utils import timezone
 from rest_framework import serializers
-from .models import User, ProfileImage, Conversation, Message, ImageShareGrant, LocationShareGrant, FaceVerification, Interest
+from .models import User, Persona, ProfileImage, Album, AlbumGrant, Conversation, Message, LocationShareGrant, FaceVerification
 
 
 def normalize_phone(value: str) -> str:
@@ -24,52 +24,61 @@ def _fuzz_coords(lat: float, lng: float, seed: int) -> tuple[float, float]:
     return lat + rng.uniform(-0.004, 0.004), lng + rng.uniform(-0.004, 0.004)
 
 
-_TAG_FIELDS = ('face', 'torso', 'explicit', 'other')
+def _image_url(image: ProfileImage, request) -> str:
+    url = image.image.url
+    return request.build_absolute_uri(url) if request else url
 
 
-def _tag_q(tag: str) -> Q:
-    return Q(**{f'tag_{tag}': True})
+def _public_images(persona) -> list[ProfileImage]:
+    """The persona's public photos in display order (uses prefetched `photos` when present)."""
+    cache = getattr(persona, '_prefetched_objects_cache', {})
+    photos = cache['photos'] if 'photos' in cache else persona.photos.select_related('image')
+    return [pp.image for pp in photos]
 
 
-def _untagged_q() -> Q:
-    return Q(tag_face=False, tag_torso=False, tag_explicit=False, tag_other=False)
+def _granted_images(persona, viewer_persona) -> list[ProfileImage]:
+    """Images in albums `persona` has actively granted to `viewer_persona`, excluding public ones."""
+    if viewer_persona is None or viewer_persona.pk == persona.pk:
+        return []
+    now = timezone.now()
+    album_ids = AlbumGrant.objects.filter(
+        grantor=persona, grantee=viewer_persona,
+    ).filter(Q(expires_at__isnull=True) | Q(expires_at__gt=now)).values_list('album_id', flat=True)
+    public_ids = {img.pk for img in _public_images(persona)}
+    return list(
+        ProfileImage.objects
+        .filter(albums__in=album_ids)
+        .exclude(pk__in=public_ids)
+        .distinct()
+    )
 
 
-def _public_filter(user) -> Q | None:
-    """
-    Returns a Q that matches images visible to the public, or None if nothing
-    should be shown (share_images master toggle is off).
+def _first_photo_url(persona, request) -> str | None:
+    images = _public_images(persona)
+    return _image_url(images[0], request) if images else None
 
-    An image is visible only when none of its active tags belong to a category
-    the user hasn't opted into sharing.  This prevents multi-tagged images
-    (e.g. face + explicit) from leaking through a category the viewer isn't
-    allowed to see.
-    """
-    if not user.share_images:
+
+def _is_verified(user) -> bool:
+    try:
+        return user.verification.status == FaceVerification.STATUS_VERIFIED
+    except FaceVerification.DoesNotExist:
+        return False
+
+
+def _location_at_level(persona, level: int, coord: int) -> float | None:
+    """coord 0 = latitude, 1 = longitude. Fuzz is seeded per persona so profiles don't share offsets."""
+    user = persona.user
+    if user.latitude is None or user.longitude is None:
         return None
-    q = Q()
-    if not user.share_face:     q &= Q(tag_face=False)
-    if not user.share_torso:    q &= Q(tag_torso=False)
-    if not user.share_explicit: q &= Q(tag_explicit=False)
-    if not user.share_other:    q &= Q(tag_other=False)
-    return q
-
-
-def _viewer_filter(user, viewer) -> Q | None:
-    """Public filter + any active (non-expired) categories the user has granted to viewer."""
-    q = _public_filter(user)
-    if viewer and viewer.pk != user.pk:
-        now = timezone.now()
-        grants = ImageShareGrant.objects.filter(
-            grantor=user, grantee=viewer,
-        ).filter(Q(expires_at__isnull=True) | Q(expires_at__gt=now)).values_list('category', flat=True)
-        for cat in grants:
-            extra = _tag_q(cat)
-            q = extra if q is None else (q | extra)
-    return q
+    if level == 2:
+        return (user.latitude, user.longitude)[coord]
+    if level == 1:
+        return _fuzz_coords(user.latitude, user.longitude, persona.pk)[coord]
+    return None
 
 
 class GalleryImageSerializer(serializers.ModelSerializer):
+    """A library image."""
     url = serializers.SerializerMethodField()
     tags = serializers.SerializerMethodField()
 
@@ -78,77 +87,32 @@ class GalleryImageSerializer(serializers.ModelSerializer):
         fields = ['id', 'url', 'order', 'tags']
 
     def get_url(self, obj):
-        request = self.context.get('request')
-        return request.build_absolute_uri(obj.image.url) if request else obj.image.url
+        return _image_url(obj, self.context.get('request'))
 
     def get_tags(self, obj):
         return obj.tags
 
 
-def _first_gallery_url(obj, request, image_filter: Q | None = ...):
-    """
-    Return the URL of the first visible gallery image, or None.
-    Pass image_filter=None explicitly to return the first image with no filtering.
-    The default sentinel skips filtering entirely (used for the owner's own profile).
-    """
-    qs = obj.gallery_images.order_by('order', 'created_at')
-    if image_filter is not ...:
-        if image_filter is None:
-            return None
-        qs = qs.filter(image_filter)
-    first = qs.first()
-    if first is None:
-        return None
-    url = first.image.url
-    return request.build_absolute_uri(url) if request else url
-
-
-class ProfileSerializer(serializers.ModelSerializer):
-    """Serializer for the logged-in user's own profile — shows all images unfiltered."""
-    profile_picture = serializers.SerializerMethodField()
-    gallery_images = GalleryImageSerializer(many=True, read_only=True)
+class AccountSerializer(serializers.ModelSerializer):
+    """Account-wide settings for the logged-in user."""
     verification_status = serializers.SerializerMethodField()
+    persona_limit = serializers.SerializerMethodField()
+    library_limit = serializers.SerializerMethodField()
 
     class Meta:
         model = User
         fields = [
-            "profile_picture",
-            "gallery_images",
-            "display_name",
-            "bio",
-            "pronouns",
-            "age",
             "notifications_enabled",
-            "intent",
-            "looking_for_chat",
-            "looking_for_cuddle",
-            "looking_for_fool_around",
-            "looking_for_sex",
-            "location_sharing",
-            "share_images",
-            "share_face",
-            "share_torso",
-            "share_explicit",
-            "share_other",
             "blur_explicit",
-            "height",
-            "length",
-            "kinks",
-            "share_kinks",
-            "interests",
-            "relationship_types",
-            "position",
-            "power_position",
-            "can_host",
-            "can_travel",
             "latitude",
             "longitude",
             "subscription_tier",
             "verification_status",
+            "active_persona_id",
+            "persona_limit",
+            "library_limit",
         ]
-
-    def get_profile_picture(self, obj):
-        return _first_gallery_url(obj, self.context.get('request'))
+        read_only_fields = ["subscription_tier", "active_persona_id"]
 
     def get_verification_status(self, obj):
         try:
@@ -156,18 +120,57 @@ class ProfileSerializer(serializers.ModelSerializer):
         except FaceVerification.DoesNotExist:
             return None
 
+    def get_persona_limit(self, obj):
+        return obj.persona_limit()
 
-class DiscoverUserSerializer(serializers.ModelSerializer):
-    """Public-facing profile for the discover feed — images filtered by public settings."""
+    def get_library_limit(self, obj):
+        return obj.library_limit()
+
+
+class PersonaSummarySerializer(serializers.ModelSerializer):
+    """Compact entry for the persona switcher. Context: `unlocked_ids`, optional `unread_counts`."""
+    profile_picture = serializers.SerializerMethodField()
+    is_locked = serializers.SerializerMethodField()
+    unread_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Persona
+        fields = ['id', 'display_name', 'profile_picture', 'color', 'is_primary', 'sort_order', 'is_locked', 'unread_count']
+
+    def get_profile_picture(self, obj):
+        return _first_photo_url(obj, self.context.get('request'))
+
+    def get_is_locked(self, obj):
+        return obj.pk not in self.context['unlocked_ids']
+
+    def get_unread_count(self, obj):
+        return self.context.get('unread_counts', {}).get(obj.pk, 0)
+
+
+class PersonaSerializer(PersonaSummarySerializer):
+    """Full editable persona for its owner. `gallery_images` are its public photos."""
+    gallery_images = serializers.SerializerMethodField()
+
+    class Meta(PersonaSummarySerializer.Meta):
+        fields = PersonaSummarySerializer.Meta.fields + ['gallery_images'] + Persona.PROFILE_FIELDS
+        read_only_fields = ['is_primary']
+
+    def get_gallery_images(self, obj):
+        return GalleryImageSerializer(_public_images(obj), many=True, context=self.context).data
+
+
+class DiscoverPersonaSerializer(serializers.ModelSerializer):
+    """Public-facing persona for the discover feed."""
     profile_picture = serializers.SerializerMethodField()
     gallery_images = serializers.SerializerMethodField()
     latitude = serializers.SerializerMethodField()
     longitude = serializers.SerializerMethodField()
+    neighborhood = serializers.CharField(source='user.neighborhood', read_only=True)
     is_verified = serializers.SerializerMethodField()
     kinks = serializers.SerializerMethodField()
 
     class Meta:
-        model = User
+        model = Persona
         fields = [
             "id",
             "display_name",
@@ -198,91 +201,83 @@ class DiscoverUserSerializer(serializers.ModelSerializer):
         ]
 
     def get_is_verified(self, obj):
-        try:
-            return obj.verification.status == FaceVerification.STATUS_VERIFIED
-        except FaceVerification.DoesNotExist:
-            return False
+        return _is_verified(obj.user)
 
     def get_kinks(self, obj):
         return obj.kinks if obj.share_kinks else []
 
     def get_profile_picture(self, obj):
-        return _first_gallery_url(obj, self.context.get('request'), _public_filter(obj))
+        return _first_photo_url(obj, self.context.get('request'))
 
     def get_gallery_images(self, obj):
-        f = _public_filter(obj)
-        qs = obj.gallery_images.filter(f) if f is not None else obj.gallery_images.none()
-        return GalleryImageSerializer(qs, many=True, context=self.context).data
+        return GalleryImageSerializer(_public_images(obj), many=True, context=self.context).data
+
+    def _location_level(self, obj) -> int:
+        return obj.location_sharing
 
     def get_latitude(self, obj):
-        if obj.location_sharing == 2:
-            return obj.latitude
-        if obj.location_sharing == 1 and obj.latitude is not None:
-            return _fuzz_coords(obj.latitude, obj.longitude, obj.pk)[0]
-        return None
+        return _location_at_level(obj, self._location_level(obj), 0)
 
     def get_longitude(self, obj):
-        if obj.location_sharing == 2:
-            return obj.longitude
-        if obj.location_sharing == 1 and obj.longitude is not None:
-            return _fuzz_coords(obj.latitude, obj.longitude, obj.pk)[1]
-        return None
+        return _location_at_level(obj, self._location_level(obj), 1)
 
 
-class UserProfileSerializer(DiscoverUserSerializer):
-    """Single-user profile view — adds grant-based images and location on top of public ones."""
+class PersonaProfileSerializer(DiscoverPersonaSerializer):
+    """
+    Single-persona view — adds album- and location-grant access on top of public data.
+    Context: `viewer_persona` (the viewer's active persona).
+    """
     effective_location_sharing = serializers.SerializerMethodField()
 
-    class Meta(DiscoverUserSerializer.Meta):
-        fields = DiscoverUserSerializer.Meta.fields + ['effective_location_sharing']
-
-    def get_effective_location_sharing(self, obj):
-        grant_level = self._location_grant_level(obj)
-        return max(obj.location_sharing, grant_level or 0)
-
-    def get_profile_picture(self, obj):
-        viewer = self.context['request'].user
-        return _first_gallery_url(obj, self.context['request'], _viewer_filter(obj, viewer))
+    class Meta(DiscoverPersonaSerializer.Meta):
+        fields = DiscoverPersonaSerializer.Meta.fields + ['effective_location_sharing']
 
     def get_gallery_images(self, obj):
-        viewer = self.context['request'].user
-        f = _viewer_filter(obj, viewer)
-        qs = obj.gallery_images.filter(f) if f is not None else obj.gallery_images.none()
-        return GalleryImageSerializer(qs, many=True, context=self.context).data
+        images = _public_images(obj) + _granted_images(obj, self.context.get('viewer_persona'))
+        return GalleryImageSerializer(images, many=True, context=self.context).data
 
     def _location_grant_level(self, obj):
-        viewer = self.context['request'].user
-        if viewer.pk == obj.pk:
+        viewer = self.context.get('viewer_persona')
+        if viewer is None or viewer.pk == obj.pk:
             return None
-        now = timezone.now()
-        grant = LocationShareGrant.objects.filter(
-            grantor=obj, grantee=viewer,
-        ).filter(Q(expires_at__isnull=True) | Q(expires_at__gt=now)).first()
-        return grant.level if grant else None
+        if not hasattr(self, '_grant_levels'):
+            self._grant_levels = {}
+        if obj.pk not in self._grant_levels:
+            now = timezone.now()
+            grant = LocationShareGrant.objects.filter(
+                grantor=obj, grantee=viewer,
+            ).filter(Q(expires_at__isnull=True) | Q(expires_at__gt=now)).first()
+            self._grant_levels[obj.pk] = grant.level if grant else None
+        return self._grant_levels[obj.pk]
 
-    def get_latitude(self, obj):
-        grant_level = self._location_grant_level(obj)
-        effective = max(obj.location_sharing, grant_level or 0)
-        if effective == 2:
-            return obj.latitude
-        if effective == 1 and obj.latitude is not None:
-            return _fuzz_coords(obj.latitude, obj.longitude, obj.pk)[0]
-        return None
+    def _location_level(self, obj) -> int:
+        return max(obj.location_sharing, self._location_grant_level(obj) or 0)
 
-    def get_longitude(self, obj):
-        grant_level = self._location_grant_level(obj)
-        effective = max(obj.location_sharing, grant_level or 0)
-        if effective == 2:
-            return obj.longitude
-        if effective == 1 and obj.longitude is not None:
-            return _fuzz_coords(obj.latitude, obj.longitude, obj.pk)[1]
-        return None
+    def get_effective_location_sharing(self, obj):
+        return self._location_level(obj)
 
 
-class ImageShareGrantSerializer(serializers.ModelSerializer):
+class AlbumSerializer(serializers.ModelSerializer):
+    image_ids = serializers.SerializerMethodField()
+    cover_url = serializers.SerializerMethodField()
+
     class Meta:
-        model = ImageShareGrant
-        fields = ['id', 'grantee_id', 'category', 'expires_at', 'created_at']
+        model = Album
+        fields = ['id', 'name', 'image_ids', 'cover_url', 'created_at']
+        read_only_fields = ['id', 'created_at']
+
+    def get_image_ids(self, obj):
+        return [img.pk for img in obj.images.all()]
+
+    def get_cover_url(self, obj):
+        images = list(obj.images.all())
+        return _image_url(images[0], self.context.get('request')) if images else None
+
+
+class AlbumGrantSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AlbumGrant
+        fields = ['id', 'grantee_id', 'album_id', 'expires_at', 'created_at']
         read_only_fields = ['id', 'created_at']
 
 
@@ -312,14 +307,14 @@ class ConversationSerializer(serializers.ModelSerializer):
         fields = ['id', 'other_user', 'last_message', 'unread_count', 'updated_at']
 
     def get_other_user(self, obj):
-        request = self.context['request']
-        other = next((p for p in obj.participants.all() if p.pk != request.user.pk), None)
+        me = self.context['persona']
+        other = next((p for p in obj.participants.all() if p.pk != me.pk), None)
         if other is None:
             return None
         return {
             'id': other.id,
             'display_name': other.display_name,
-            'profile_picture': _first_gallery_url(other, request, _public_filter(other)),
+            'profile_picture': _first_photo_url(other, self.context['request']),
         }
 
     def get_last_message(self, obj):
@@ -337,7 +332,7 @@ class ConversationSerializer(serializers.ModelSerializer):
         }
 
     def get_unread_count(self, obj):
-        me = self.context['request'].user
+        me = self.context['persona']
         if hasattr(obj, 'prefetched_messages'):
             return sum(1 for m in obj.prefetched_messages if not m.is_read and m.sender_id != me.pk)
         return obj.messages.filter(is_read=False).exclude(sender=me).count()

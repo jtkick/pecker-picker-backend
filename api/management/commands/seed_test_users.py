@@ -21,7 +21,7 @@ from django.utils import timezone
 from PIL import Image, ImageDraw
 
 from api.geocoding import reverse_geocode
-from api.models import ProfileImage, User
+from api.models import Persona, PersonaPhoto, ProfileImage, User
 from api.tagging import auto_tag
 
 SEED_IMAGES_DIR = Path(__file__).parent / "seed_images"
@@ -305,10 +305,20 @@ class Command(BaseCommand):
             user, created = User.objects.get_or_create(phone_number=data["phone_number"])
             user.set_unusable_password()
 
-            for field, value in data.items():
-                setattr(user, field, value)
+            # Pre-persona seed data: share_* toggles decide which images are public.
+            share = {t: data.get(f"share_{t}", False) for t in ("face", "torso", "explicit", "other")}
+            share_images = data.get("share_images", False)
 
+            for field in ("notifications_enabled", "latitude", "longitude"):
+                setattr(user, field, data[field])
             user.save()
+
+            persona = user.get_active_persona()
+            for field in Persona.PROFILE_FIELDS:
+                if field in data:
+                    setattr(persona, field, data[field])
+            persona.save()
+            persona.photos.all().delete()
 
             if user.latitude is not None and user.longitude is not None:
                 neighborhood = reverse_geocode(user.latitude, user.longitude)
@@ -356,11 +366,15 @@ class Command(BaseCommand):
                 obj.image.save(fname, content, save=False)
                 obj.save()
 
+                img_tags = [t for t in share if tag_kw.get(f'tag_{t}')]
+                if share_images and all(share[t] for t in img_tags) and persona.photos.count() < 6:
+                    PersonaPhoto.objects.create(persona=persona, image=obj, order=persona.photos.count())
+
                 active = [t for t in ('face', 'torso', 'explicit', 'other') if tag_kw.get(f'tag_{t}')]
                 self.stdout.write(f"      [{source}] {fname}: {', '.join(active) or 'other'}")
 
             status = "created" if created else "updated"
-            self.stdout.write(f"  {user.display_name} ({user.phone_number}) — {status}")
+            self.stdout.write(f"  {persona.display_name} ({user.phone_number}) — {status}")
 
         self.stdout.write(self.style.SUCCESS(f"\n✓ {len(TEST_USERS)} test users ready."))
 
@@ -382,7 +396,7 @@ class Command(BaseCommand):
                 try:
                     img = user.gallery_images.get(order=order)
                 except ProfileImage.DoesNotExist:
-                    self.stdout.write(f"    ⚠ {user.display_name} image order={order} not found")
+                    self.stdout.write(f"    ⚠ {phone} image order={order} not found")
                     continue
 
                 img.tag_face     = 'face'     in manual
@@ -392,7 +406,7 @@ class Command(BaseCommand):
                 img.save(update_fields=['tag_face', 'tag_torso', 'tag_explicit', 'tag_other'])
 
                 active = [t for t in ('face', 'torso', 'explicit', 'other') if getattr(img, f'tag_{t}')]
-                self.stdout.write(f"      {user.display_name} [{order}]: {', '.join(active) or '(none)'}")
+                self.stdout.write(f"      {phone} [{order}]: {', '.join(active) or '(none)'}")
                 updated += 1
 
         self.stdout.write(self.style.SUCCESS(f"\n✓ {updated} images re-tagged."))
@@ -411,6 +425,6 @@ class Command(BaseCommand):
                 img.image.delete(save=False)
                 img.delete()
             user.delete()
-            self.stdout.write(f"  Deleted {user.display_name}")
+            self.stdout.write(f"  Deleted {user.phone_number}")
 
         self.stdout.write(self.style.SUCCESS(f"\n✓ Removed {count} test users."))

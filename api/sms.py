@@ -5,16 +5,30 @@ logger = logging.getLogger(__name__)
 
 
 def send_otp_sms(phone_number: str, code: str) -> None:
-    if not settings.TWILIO_ENABLED:
-        print(f"[DEV] OTP for {phone_number}: {code}", flush=True)
-        return
+    """Dev-only path: log the OTP instead of sending real SMS."""
+    logger.warning("[DEV] OTP for %s: %s", phone_number, code)
 
+
+def send_verify_sms(phone_number: str) -> None:
+    """Start a Twilio Verify check — Twilio generates and sends the code."""
     from twilio.rest import Client
 
     client = Client(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN)
-    msg = client.messages.create(
-        body=f"Your Pecker Picker code is {code}. Valid for {settings.OTP_EXPIRY_MINUTES} minutes.",
-        from_=settings.TWILIO_PHONE_NUMBER,
+    verification = client.verify.v2.services(settings.TWILIO_VERIFY_SERVICE_SID).verifications.create(
         to=phone_number,
+        channel="sms",
     )
-    logger.info("SMS queued to %s — SID: %s status: %s", phone_number, msg.sid, msg.status)
+    logger.info("Verify started for %s — status: %s", phone_number, verification.status)
+
+
+def check_verify_sms(phone_number: str, code: str) -> bool:
+    """Check a Twilio Verify code. Returns True if approved."""
+    from twilio.rest import Client
+
+    client = Client(settings.TWILIO_ACCOUNT_SID, settings.TWILIO_AUTH_TOKEN)
+    result = client.verify.v2.services(settings.TWILIO_VERIFY_SERVICE_SID).verification_checks.create(
+        to=phone_number,
+        code=code,
+    )
+    logger.info("Verify check for %s — status: %s", phone_number, result.status)
+    return result.status == "approved"
