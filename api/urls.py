@@ -49,6 +49,10 @@ urlpatterns = [
     path("conversations/<int:pk>/read/", views.conversation_read, name="conversation-read"),
     path("conversations/<int:pk>/messages/<int:message_id>/", views.message_detail, name="message-detail"),
     path("conversations/<int:pk>/messages/<int:message_id>/hide/", views.message_hide, name="message-hide"),
+    path(
+        "conversations/<int:pk>/messages/<int:message_id>/attachments/<int:attachment_id>/view/",
+        views.attachment_view, name="attachment-view",
+    ),
     path("conversations/<int:pk>/messages/<int:message_id>/reaction/", views.message_reaction, name="message-reaction"),
     path("phrases/", views.phrases, name="phrases"),
     path("phrases/<int:pk>/", views.phrase_delete, name="phrase-delete"),

@@ -7,6 +7,7 @@ from unittest import mock
 from asgiref.testing import ApplicationCommunicator
 from channels.db import database_sync_to_async
 from channels.layers import get_channel_layer
+from django.core.cache import cache
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import override_settings
 from django.utils import timezone
@@ -208,9 +209,10 @@ class AlbumGrantTests(PersonaTestCase):
         self.assertEqual([g['id'] for g in res.data['gallery_images']], [self.private.pk, self.public.pk])
 
 
-class MessagingTests(PersonaTestCase):
+class MessagingTestCase(PersonaTestCase):
     def setUp(self):
         super().setUp()
+        cache.clear()   # send throttle counts persist across tests otherwise
         self.conv = Conversation.objects.create()
         self.conv.participants.add(self.alice_main, self.bob_main)
         self.url = f'/api/conversations/{self.conv.pk}/messages/'
@@ -223,6 +225,8 @@ class MessagingTests(PersonaTestCase):
         self.as_user(user)
         return {p['id']: p['unread_count'] for p in self.client.get('/api/personas/').data}[persona.pk]
 
+
+class MessagingTests(MessagingTestCase):
     def test_cursor_pagination(self):
         ids = [self.send(self.alice, f'm{i}').data['id'] for i in range(5)]
         self.as_user(self.bob)
@@ -304,7 +308,7 @@ class MessagingTests(PersonaTestCase):
         self.assertFalse(DeviceToken.objects.exists())
 
 
-class MessageInteractionTests(MessagingTests):
+class MessageInteractionTests(MessagingTestCase):
     def msg_url(self, mid, suffix=''):
         return f'{self.url}{mid}/{suffix}'
 
@@ -406,6 +410,67 @@ class MessageInteractionTests(MessagingTests):
         bob_alt = Persona.objects.create(user=self.bob, display_name='Bob Alt')
         User.objects.filter(pk=self.bob.pk).update(active_persona=bob_alt)
         self.assertIsNone(bob()['last_active_at'])
+
+def jpeg(name='p.jpg', with_exif=True):
+    exif = Image.Exif()
+    if with_exif:
+        exif[0x010F] = 'PhoneMaker'
+    buf = io.BytesIO()
+    Image.new('RGB', (40, 30)).save(buf, format='JPEG', exif=exif)
+    return SimpleUploadedFile(name, buf.getvalue(), content_type='image/jpeg')
+
+
+@override_settings(STORAGES={
+    'default': {'BACKEND': 'django.core.files.storage.InMemoryStorage'},
+    'staticfiles': {'BACKEND': 'django.contrib.staticfiles.storage.StaticFilesStorage'},
+})
+class ImageMessageTests(MessagingTestCase):
+    def send_images(self, user, files, **extra):
+        self.as_user(user)
+        return self.client.post(self.url, {'kind': 'image', 'files': files, **extra}, format='multipart')
+
+    @mock.patch('api.views.auto_tag', return_value={'tag_explicit': True})
+    def test_send_photos_strips_metadata_and_tags(self, _):
+        res = self.send_images(self.alice, [jpeg(), jpeg('q.jpg')], body='look')
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(res.data['kind'], 'image')
+        attachments = res.data['attachments']
+        self.assertEqual([(a['width'], a['height'], a['explicit'], a['mime']) for a in attachments],
+                         [(40, 30, True, 'image/jpeg')] * 2)
+        stored = Message.objects.get().attachments.first().file
+        with stored.open('rb') as f:
+            self.assertEqual(dict(Image.open(f).getexif()), {})
+
+    def test_photo_validation(self):
+        self.assertEqual(self.send_images(self.alice, []).status_code, 400)
+        self.assertEqual(self.send_images(self.alice, [jpeg() for _ in range(5)]).status_code, 400)
+        junk = SimpleUploadedFile('x.jpg', b'nope', content_type='image/jpeg')
+        self.assertEqual(self.send_images(self.alice, [junk]).status_code, 400)
+        self.assertEqual(self.send_images(self.alice, [jpeg(), jpeg()], view_once='true').status_code, 400)
+        self.as_user(self.alice)
+        self.assertEqual(self.client.post(self.url, {'kind': 'voice', 'body': 'x'}).status_code, 400)
+
+    def test_view_once_opens_exactly_once(self):
+        res = self.send_images(self.alice, [jpeg()], view_once='true')
+        attachment = res.data['attachments'][0]
+        self.assertIsNone(attachment['url'])
+        view_url = f"{self.url}{res.data['id']}/attachments/{attachment['id']}/view/"
+
+        self.assertEqual(self.client.post(view_url).status_code, 403)   # sender can't open it
+        self.as_user(self.bob)
+        first = self.client.post(view_url)
+        self.assertEqual((first.status_code, first['Content-Type']), (200, 'image/jpeg'))
+        self.assertEqual(Image.open(io.BytesIO(first.content)).size, (40, 30))
+        self.assertEqual(self.client.post(view_url).status_code, 410)
+        self.assertFalse(Message.objects.get().attachments.get().file)
+        self.assertTrue(self.client.get(self.url).data[0]['attachments'][0]['viewed'])
+
+    def test_unsend_removes_photos(self):
+        mid = self.send_images(self.alice, [jpeg()]).data['id']
+        self.as_user(self.alice)
+        res = self.client.delete(f'{self.url}{mid}/')
+        self.assertEqual(res.data['attachments'], [])
+        self.assertFalse(Message.objects.get().attachments.exists())
 
 class SocketClient(ApplicationCommunicator):
     """Minimal WebSocket test client (channels.testing needs daphne)."""

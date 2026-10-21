@@ -276,6 +276,7 @@ class ConversationMember(models.Model):
 
 class Message(models.Model):
     KIND_TEXT = 'text'
+    KIND_IMAGE = 'image'
     KIND_CHOICES = [
         (KIND_TEXT, 'Text'),
         ('image', 'Image'),
@@ -315,6 +316,24 @@ class Message(models.Model):
         constraints = [
             models.UniqueConstraint(fields=['sender', 'client_id'], name='unique_message_client_id'),
         ]
+
+
+class MessageAttachment(models.Model):
+    """A file sent in a message (photos for now)."""
+    message = models.ForeignKey(Message, on_delete=models.CASCADE, related_name='attachments')
+    order = models.SmallIntegerField(default=0)
+    # Emptied once a view-once photo has been opened.
+    file = models.FileField(upload_to='chat/', blank=True)
+    mime = models.CharField(max_length=50)
+    size = models.PositiveIntegerField(default=0)
+    width = models.PositiveIntegerField(null=True, blank=True)
+    height = models.PositiveIntegerField(null=True, blank=True)
+    tag_explicit = models.BooleanField(default=False)
+    view_once = models.BooleanField(default=False)
+    viewed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['order']
 
 
 class MessageReaction(models.Model):

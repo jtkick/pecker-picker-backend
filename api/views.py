@@ -1,14 +1,18 @@
+import io
 import json
 import logging
 import random
 import string
 import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
 
 logger = logging.getLogger(__name__)
 
+from django.http import HttpResponse
 from django.shortcuts import get_object_or_404
+from PIL import Image
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
 from rest_framework import status
@@ -37,7 +41,7 @@ from webauthn.helpers.structs import (
     UserVerificationRequirement,
     AttestationConveyancePreference,
 )
-from .models import User, Persona, PersonaPhoto, ProfileImage, Album, AlbumGrant, Conversation, ConversationMember, DeviceToken, Message, MessageReaction, SavedPhrase, LocationShareGrant, Block, Report, FaceVerification, Kink, Interest, PasskeyCredential, WebAuthnChallenge, OTPVerification
+from .models import User, Persona, PersonaPhoto, ProfileImage, Album, AlbumGrant, Conversation, ConversationMember, DeviceToken, Message, MessageAttachment, MessageReaction, SavedPhrase, LocationShareGrant, Block, Report, FaceVerification, Kink, Interest, PasskeyCredential, WebAuthnChallenge, OTPVerification
 from .sms import send_otp_sms, send_verify_sms, check_verify_sms
 from .serializers import (
     AccountSerializer, PersonaSummarySerializer, PersonaSerializer,
@@ -970,7 +974,11 @@ def _conversation_qs(me):
 
 def _message_qs(me):
     """Messages as `me` sees them: without ones I deleted for myself."""
-    return Message.objects.exclude(hidden_for=me).select_related('reply_to').prefetch_related('reactions')
+    return (
+        Message.objects.exclude(hidden_for=me)
+        .select_related('reply_to')
+        .prefetch_related('reactions', 'attachments')
+    )
 
 
 def _my_membership(request, pk):
@@ -1074,9 +1082,13 @@ def conversation_messages(request, pk):
         if existing is not None:
             return Response(MessageSerializer(existing).data, status=status.HTTP_200_OK)
 
+    kind = request.data.get('kind') or Message.KIND_TEXT
+    if kind not in (Message.KIND_TEXT, Message.KIND_IMAGE):
+        return Response({'error': 'Unsupported message kind.'}, status=status.HTTP_400_BAD_REQUEST)
     body = (request.data.get('body') or '').strip()
-    if not body:
+    if kind == Message.KIND_TEXT and not body:
         return Response({'error': 'Message body is required.'}, status=status.HTTP_400_BAD_REQUEST)
+    view_once = kind == Message.KIND_IMAGE and str(request.data.get('view_once')).lower() == 'true'
 
     reply_to = None
     if request.data.get('reply_to_id') is not None:
@@ -1093,13 +1105,23 @@ def conversation_messages(request, pk):
     ).exists():
         return Response({'error': 'You can no longer message this user.'}, status=status.HTTP_403_FORBIDDEN)
 
+    images = []
+    if kind == Message.KIND_IMAGE:
+        images, err = _chat_images(request)
+        if err:
+            return err
+        if view_once and len(images) != 1:
+            return Response({'error': 'View-once messages hold a single photo.'}, status=status.HTTP_400_BAD_REQUEST)
+
     metadata = {'forwarded': True} if request.data.get('forwarded') is True else {}
     try:
         with transaction.atomic():
             msg = Message.objects.create(
-                conversation=conv, sender=me, body=body, client_id=client_id, reply_to=reply_to,
-                metadata=metadata,
+                conversation=conv, sender=me, kind=kind, body=body, client_id=client_id,
+                reply_to=reply_to, metadata=metadata,
             )
+            for order, image in enumerate(images):
+                MessageAttachment.objects.create(message=msg, order=order, view_once=view_once, **image)
     except IntegrityError:
         # A concurrent retry with the same client_id won the race.
         return Response(MessageSerializer(Message.objects.get(sender=me, client_id=client_id)).data)
@@ -1108,10 +1130,46 @@ def conversation_messages(request, pk):
     # Your own messages are read by you; a new message brings the chat back out of the archive.
     ConversationMember.objects.filter(pk=member.pk).update(last_read_message=msg, last_delivered_message=msg)
     conv.members.exclude(pk=member.pk).filter(archived=True).update(archived=False)
-    data = MessageSerializer(msg).data
+    data = MessageSerializer(_message_qs(me).get(pk=msg.pk)).data
     broadcast(conv.pk, {'type': 'message.new', 'conversation_id': conv.pk, 'message': data})
     notify_new_message(msg)
     return Response(data, status=status.HTTP_201_CREATED)
+
+
+def _chat_images(request):
+    """
+    Validate and prepare the `files` of an image message: metadata stripped,
+    dimensions read and explicit content tagged before anyone can see them.
+    Returns (list of MessageAttachment field dicts, error_response).
+    """
+    files = request.FILES.getlist('files')
+    if not 1 <= len(files) <= settings.MAX_CHAT_IMAGES:
+        return None, Response(
+            {'error': f'Send 1–{settings.MAX_CHAT_IMAGES} photos.'}, status=status.HTTP_400_BAD_REQUEST,
+        )
+    max_bytes = settings.MAX_UPLOAD_SIZE_MB * 1024 * 1024
+    prepared = []
+    for upload in files:
+        if upload.size > max_bytes:
+            return None, Response(
+                {'error': f'Photos must be under {settings.MAX_UPLOAD_SIZE_MB}MB.'}, status=status.HTTP_400_BAD_REQUEST,
+            )
+        clean = strip_image_metadata(upload)
+        if clean is None:
+            return None, Response({'error': 'Unsupported image format.'}, status=status.HTTP_400_BAD_REQUEST)
+        data = clean.read()
+        clean.seek(0)
+        with Image.open(io.BytesIO(data)) as img:
+            width, height = img.size
+            mime = Image.MIME.get(img.format, 'image/jpeg')
+        prepared.append({'file': clean, 'mime': mime, 'size': len(data), 'width': width, 'height': height})
+    # Tag in parallel; Rekognition is a network call per photo.
+    with ThreadPoolExecutor(max_workers=len(prepared)) as pool:
+        tags = list(pool.map(lambda p: auto_tag(p['file'].read()), prepared))
+    for image, tag in zip(prepared, tags):
+        image['file'].seek(0)
+        image['tag_explicit'] = tag.get('tag_explicit', False)
+    return prepared, None
 
 
 @api_view(['PATCH'])
@@ -1162,6 +1220,9 @@ def message_detail(request, pk, message_id):
         msg.metadata = {}
         msg.save(update_fields=['deleted_at', 'body', 'metadata'])
         msg.reactions.all().delete()
+        for attachment in msg.attachments.all():
+            attachment.file.delete(save=False)
+        msg.attachments.all().delete()
     else:
         body = (request.data.get('body') or '').strip()
         if msg.kind != Message.KIND_TEXT or not body or len(body) > 2000:
@@ -1174,6 +1235,33 @@ def message_detail(request, pk, message_id):
     data = MessageSerializer(msg).data
     broadcast(msg.conversation_id, {'type': 'message.updated', 'conversation_id': msg.conversation_id, 'message': data})
     return Response(data)
+
+
+@api_view(['POST'])
+def attachment_view(request, pk, message_id, attachment_id):
+    """
+    Open a view-once photo: returns the image bytes once, then deletes the
+    file so no URL to it ever exists. The sender can't open it.
+    """
+    member, msg = _member_message(request, pk, message_id)
+    attachment = get_object_or_404(msg.attachments, pk=attachment_id, view_once=True)
+    if msg.sender_id == member.persona_id:
+        return Response({'error': 'You sent this photo.'}, status=status.HTTP_403_FORBIDDEN)
+    # Claim the single view atomically so concurrent requests can't both succeed.
+    claimed = MessageAttachment.objects.filter(pk=attachment.pk, viewed_at__isnull=True).update(
+        viewed_at=timezone.now(),
+    )
+    if not claimed or not attachment.file:
+        return Response({'error': 'This photo was already opened.'}, status=status.HTTP_410_GONE)
+    with attachment.file.open('rb') as f:
+        data = f.read()
+    attachment.file.delete(save=False)
+    MessageAttachment.objects.filter(pk=attachment.pk).update(file='')
+    msg = _message_qs(member.persona).get(pk=msg.pk)
+    broadcast(msg.conversation_id, {
+        'type': 'message.updated', 'conversation_id': msg.conversation_id, 'message': MessageSerializer(msg).data,
+    })
+    return HttpResponse(data, content_type=attachment.mime)
 
 
 @api_view(['POST'])

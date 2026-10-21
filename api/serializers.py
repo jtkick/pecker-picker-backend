@@ -293,13 +293,27 @@ class MessageSerializer(serializers.ModelSerializer):
     conversation_id = serializers.IntegerField(read_only=True)
     reply_to = serializers.SerializerMethodField()
     reactions = serializers.SerializerMethodField()
+    attachments = serializers.SerializerMethodField()
 
     class Meta:
         model = Message
         fields = [
             'id', 'conversation_id', 'sender_id', 'client_id', 'kind', 'body', 'metadata',
-            'reply_to', 'reactions', 'created_at', 'edited_at', 'deleted_at',
+            'reply_to', 'reactions', 'attachments', 'created_at', 'edited_at', 'deleted_at',
         ]
+
+    def get_attachments(self, obj):
+        # View-once photos never get a URL; they're fetched once through attachment_view.
+        return [{
+            'id': a.id,
+            'mime': a.mime,
+            'url': a.file.url if a.file and not a.view_once else None,
+            'width': a.width,
+            'height': a.height,
+            'explicit': a.tag_explicit,
+            'view_once': a.view_once,
+            'viewed': a.viewed_at is not None,
+        } for a in obj.attachments.all()]
 
     def get_reactions(self, obj):
         return [{'persona_id': r.persona_id, 'emoji': r.emoji} for r in obj.reactions.all()]
@@ -322,6 +336,7 @@ class MessageSerializer(serializers.ModelSerializer):
         if obj.deleted_at is not None:
             data['body'] = ''
             data['metadata'] = {}
+            data['attachments'] = []
         return data
 
 
