@@ -126,7 +126,7 @@ AWS_REKOGNITION_SECRET_ACCESS_KEY = os.environ.get("AWS_REKOGNITION_SECRET_ACCES
 
 # ── Object storage (MinIO locally, S3 in production) ─────────────────────────
 # Internal endpoint — used by boto3 for API calls from the Django process.
-AWS_S3_ENDPOINT_URL = os.environ.get("MINIO_ENDPOINT_URL", "http://localhost:9000")
+AWS_S3_ENDPOINT_URL = os.environ.get("MINIO_ENDPOINT_URL", "http://localhost:9010")
 AWS_ACCESS_KEY_ID = os.environ.get("MINIO_ACCESS_KEY", "peckeradmin")
 AWS_SECRET_ACCESS_KEY = os.environ.get("MINIO_SECRET_KEY", "ChangeMeNow123!")
 AWS_STORAGE_BUCKET_NAME = os.environ.get("MINIO_BUCKET", "pecker-picker")
@@ -135,9 +135,9 @@ AWS_DEFAULT_ACL = None             # Rely on bucket policy for public read
 AWS_QUERYSTRING_AUTH = False       # Public URLs — no signed query strings needed
 
 # Public base URL returned to clients so they can load images directly.
-# For MinIO: http://triangulum.cc:9000
+# For MinIO: http://triangulum.cc:9010
 # For S3:    https://your-bucket.s3.amazonaws.com  (or a CloudFront domain)
-MEDIA_PUBLIC_URL = os.environ.get("MEDIA_PUBLIC_URL", "http://triangulum.cc:9000")
+MEDIA_PUBLIC_URL = os.environ.get("MEDIA_PUBLIC_URL", "http://triangulum.cc:9010")
 
 STORAGES = {
     "default": {

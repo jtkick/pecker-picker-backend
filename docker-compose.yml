@@ -4,8 +4,8 @@ services:
     image: quay.io/minio/minio
     command: server /data --console-address ":9001"
     ports:
-      - "9000:9000"   # S3 API
-      - "9001:9001"   # Web console
+      - "9010:9000"   # S3 API
+      - "9011:9001"   # Web console
     volumes:
       - ${HOME}/minio/data:/data
     environment:
