@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes, throttle_classes
 from rest_framework.permissions import AllowAny
@@ -36,7 +37,7 @@ from webauthn.helpers.structs import (
     UserVerificationRequirement,
     AttestationConveyancePreference,
 )
-from .models import User, Persona, PersonaPhoto, ProfileImage, Album, AlbumGrant, Conversation, ConversationMember, DeviceToken, Message, LocationShareGrant, Block, Report, FaceVerification, Kink, Interest, PasskeyCredential, WebAuthnChallenge, OTPVerification
+from .models import User, Persona, PersonaPhoto, ProfileImage, Album, AlbumGrant, Conversation, ConversationMember, DeviceToken, Message, MessageReaction, SavedPhrase, LocationShareGrant, Block, Report, FaceVerification, Kink, Interest, PasskeyCredential, WebAuthnChallenge, OTPVerification
 from .sms import send_otp_sms, send_verify_sms, check_verify_sms
 from .serializers import (
     AccountSerializer, PersonaSummarySerializer, PersonaSerializer,
@@ -47,7 +48,7 @@ from .geocoding import reverse_geocode, nearby_label
 from .tagging import auto_tag
 from .media import strip_image_metadata
 from .push import notify_new_message
-from .realtime import broadcast, mark_receipt
+from .realtime import broadcast, mark_receipt, send_to_users
 from django.conf import settings
 
 
@@ -950,20 +951,26 @@ def _conversation_qs(me):
         .annotate(n=Count('id'))
         .values('n')
     )
-    members = ConversationMember.objects.select_related('persona').prefetch_related(
+    my_pinned = ConversationMember.objects.filter(conversation=OuterRef('pk'), persona=me).values('pinned')[:1]
+    members = ConversationMember.objects.select_related('persona__user').prefetch_related(
         Prefetch('persona__photos', queryset=PersonaPhoto.objects.select_related('image')),
     )
     return (
         Conversation.objects
         .filter(members__persona=me, members__left_at__isnull=True)
         .annotate(my_last_read=Subquery(my_last_read))
-        .annotate(unread=Coalesce(Subquery(unread), 0))
+        .annotate(unread=Coalesce(Subquery(unread), 0), my_pinned=Subquery(my_pinned))
         .prefetch_related(
             Prefetch('members', queryset=members),
-            Prefetch('messages', queryset=Message.objects.order_by('-id')[:1], to_attr='latest'),
+            Prefetch('messages', queryset=Message.objects.exclude(hidden_for=me).order_by('-id')[:1], to_attr='latest'),
         )
-        .order_by('-updated_at')
+        .order_by('-my_pinned', '-updated_at')
     )
+
+
+def _message_qs(me):
+    """Messages as `me` sees them: without ones I deleted for myself."""
+    return Message.objects.exclude(hidden_for=me).select_related('reply_to').prefetch_related('reactions')
 
 
 def _my_membership(request, pk):
@@ -1029,10 +1036,21 @@ def conversation_messages(request, pk):
         #   ?before=<id>  older page (scrolling up)
         #   ?after=<id>   everything newer (catch-up after a reconnect)
         #   neither       the latest page — opening the chat marks it read
+        #   ?q=<text>     search, newest-first
+        #   ?around=<id>  a page centred on one message (jumping to a search hit)
         limit = max(_int_param(request, 'limit', 50, maximum=100), 1)
         before = _int_param(request, 'before')
         after = _int_param(request, 'after')
-        qs = conv.messages.select_related('reply_to')
+        around = _int_param(request, 'around')
+        qs = _message_qs(me).filter(conversation=conv)
+        query = (request.query_params.get('q') or '').strip()
+        if query:
+            hits = qs.filter(kind=Message.KIND_TEXT, deleted_at__isnull=True, body__icontains=query)
+            return Response(MessageSerializer(hits.order_by('-id')[:limit], many=True).data)
+        if around is not None:
+            older = list(qs.filter(id__lte=around).order_by('-id')[:limit // 2 + 1])[::-1]
+            newer = list(qs.filter(id__gt=around).order_by('id')[:limit // 2])
+            return Response(MessageSerializer(older + newer, many=True).data)
         if after is not None:
             msgs = list(qs.filter(id__gt=after).order_by('id')[:limit])
         else:
@@ -1041,6 +1059,8 @@ def conversation_messages(request, pk):
             msgs = list(qs.order_by('-id')[:limit])[::-1]
         if msgs and before is None:
             mark_receipt(member, 'delivered' if after is not None else 'read', msgs[-1].id)
+        if before is None and after is None:
+            ConversationMember.objects.filter(pk=member.pk, marked_unread=True).update(marked_unread=False)
         return Response(MessageSerializer(msgs, many=True).data)
 
     # POST — send a message
@@ -1073,22 +1093,137 @@ def conversation_messages(request, pk):
     ).exists():
         return Response({'error': 'You can no longer message this user.'}, status=status.HTTP_403_FORBIDDEN)
 
+    metadata = {'forwarded': True} if request.data.get('forwarded') is True else {}
     try:
         with transaction.atomic():
             msg = Message.objects.create(
                 conversation=conv, sender=me, body=body, client_id=client_id, reply_to=reply_to,
+                metadata=metadata,
             )
     except IntegrityError:
         # A concurrent retry with the same client_id won the race.
         return Response(MessageSerializer(Message.objects.get(sender=me, client_id=client_id)).data)
 
     Conversation.objects.filter(pk=conv.pk).update(updated_at=timezone.now())
-    # Your own messages are read by you.
+    # Your own messages are read by you; a new message brings the chat back out of the archive.
     ConversationMember.objects.filter(pk=member.pk).update(last_read_message=msg, last_delivered_message=msg)
+    conv.members.exclude(pk=member.pk).filter(archived=True).update(archived=False)
     data = MessageSerializer(msg).data
     broadcast(conv.pk, {'type': 'message.new', 'conversation_id': conv.pk, 'message': data})
     notify_new_message(msg)
     return Response(data, status=status.HTTP_201_CREATED)
+
+
+@api_view(['PATCH'])
+def conversation_detail(request, pk):
+    """Update my own settings for a conversation: pinned, archived, muted_until, marked_unread."""
+    member = _my_membership(request, pk)
+    fields = []
+    for name in ('pinned', 'archived', 'marked_unread'):
+        if name in request.data:
+            value = request.data[name]
+            if not isinstance(value, bool):
+                return Response({'error': f'{name} must be a boolean.'}, status=status.HTTP_400_BAD_REQUEST)
+            setattr(member, name, value)
+            fields.append(name)
+    if 'muted_until' in request.data:
+        raw = request.data['muted_until']
+        muted_until = parse_datetime(raw) if isinstance(raw, str) else None
+        if raw is not None and muted_until is None:
+            return Response({'error': 'muted_until must be an ISO datetime or null.'}, status=status.HTTP_400_BAD_REQUEST)
+        member.muted_until = muted_until
+        fields.append('muted_until')
+    if fields:
+        member.save(update_fields=fields)
+    ctx = {'request': request, 'persona': member.persona}
+    return Response(ConversationSerializer(_conversation_qs(member.persona).get(pk=pk), context=ctx).data)
+
+
+def _member_message(request, pk, message_id):
+    member = _my_membership(request, pk)
+    msg = get_object_or_404(_message_qs(member.persona), pk=message_id, conversation_id=pk)
+    return member, msg
+
+
+@api_view(['PATCH', 'DELETE'])
+def message_detail(request, pk, message_id):
+    """The sender edits (PATCH body) or unsends (DELETE) a message within Message.EDIT_WINDOW."""
+    member, msg = _member_message(request, pk, message_id)
+    if msg.sender_id != member.persona_id:
+        return Response({'error': 'You can only change your own messages.'}, status=status.HTTP_403_FORBIDDEN)
+    if msg.deleted_at is not None:
+        return Response({'error': 'Message was deleted.'}, status=status.HTTP_400_BAD_REQUEST)
+    if timezone.now() - msg.created_at > Message.EDIT_WINDOW:
+        return Response({'error': 'Messages can only be changed for 15 minutes.'}, status=status.HTTP_403_FORBIDDEN)
+
+    if request.method == 'DELETE':
+        msg.deleted_at = timezone.now()
+        msg.body = ''
+        msg.metadata = {}
+        msg.save(update_fields=['deleted_at', 'body', 'metadata'])
+        msg.reactions.all().delete()
+    else:
+        body = (request.data.get('body') or '').strip()
+        if msg.kind != Message.KIND_TEXT or not body or len(body) > 2000:
+            return Response({'error': 'A text body of 1–2000 characters is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        msg.body = body
+        msg.edited_at = timezone.now()
+        msg.save(update_fields=['body', 'edited_at'])
+
+    msg = _message_qs(member.persona).get(pk=msg.pk)
+    data = MessageSerializer(msg).data
+    broadcast(msg.conversation_id, {'type': 'message.updated', 'conversation_id': msg.conversation_id, 'message': data})
+    return Response(data)
+
+
+@api_view(['POST'])
+def message_hide(request, pk, message_id):
+    """Delete a message for me only."""
+    member, msg = _member_message(request, pk, message_id)
+    msg.hidden_for.add(member.persona)
+    payload = {'type': 'message.hidden', 'conversation_id': msg.conversation_id, 'message_id': msg.pk}
+    transaction.on_commit(lambda: send_to_users({request.user.pk}, payload))
+    return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+@api_view(['PUT', 'DELETE'])
+def message_reaction(request, pk, message_id):
+    """Set (PUT {emoji}) or clear (DELETE) my reaction to a message."""
+    member, msg = _member_message(request, pk, message_id)
+    if msg.deleted_at is not None:
+        return Response({'error': 'Message was deleted.'}, status=status.HTTP_400_BAD_REQUEST)
+    emoji = None
+    if request.method == 'PUT':
+        emoji = request.data.get('emoji')
+        if not isinstance(emoji, str) or not emoji.strip() or len(emoji) > 16 or any(c.isspace() for c in emoji):
+            return Response({'error': 'emoji is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        MessageReaction.objects.update_or_create(message=msg, persona=member.persona, defaults={'emoji': emoji})
+    else:
+        MessageReaction.objects.filter(message=msg, persona=member.persona).delete()
+    broadcast(msg.conversation_id, {
+        'type': 'reaction', 'conversation_id': msg.conversation_id, 'message_id': msg.pk,
+        'persona_id': member.persona_id, 'emoji': emoji,
+    })
+    return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+@api_view(['GET', 'POST'])
+def phrases(request):
+    if request.method == 'GET':
+        return Response([{'id': p.id, 'text': p.text} for p in request.user.saved_phrases.all()])
+    text = (request.data.get('text') or '').strip()
+    if not text or len(text) > 300:
+        return Response({'error': 'text must be 1–300 characters.'}, status=status.HTTP_400_BAD_REQUEST)
+    if request.user.saved_phrases.count() >= settings.MAX_SAVED_PHRASES:
+        return Response({'error': f'At most {settings.MAX_SAVED_PHRASES} saved phrases.'}, status=status.HTTP_400_BAD_REQUEST)
+    phrase = SavedPhrase.objects.create(user=request.user, text=text)
+    return Response({'id': phrase.id, 'text': phrase.text}, status=status.HTTP_201_CREATED)
+
+
+@api_view(['DELETE'])
+def phrase_delete(request, pk):
+    request.user.saved_phrases.filter(pk=pk).delete()
+    return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 @api_view(['POST'])
@@ -1232,9 +1367,20 @@ def reports(request):
             {'error': f'reason must be one of {valid_reasons}.'},
             status=status.HTTP_400_BAD_REQUEST,
         )
+    message = None
+    if request.data.get('message_id') is not None:
+        # Evidence must be a message the reported persona sent to one of my personas.
+        try:
+            message = Message.objects.select_related('conversation').get(
+                pk=request.data.get('message_id'), sender=target,
+                conversation__members__persona__user=request.user,
+            )
+        except (Message.DoesNotExist, TypeError, ValueError):
+            return Response({'error': 'Message not found.'}, status=status.HTTP_404_NOT_FOUND)
     Report.objects.create(
         reporter=request.user, reported=target.user, reported_persona=target,
         reason=reason, details=details,
+        message=message, conversation=message.conversation if message else None,
     )
     return Response(status=status.HTTP_204_NO_CONTENT)
 

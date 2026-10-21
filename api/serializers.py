@@ -292,13 +292,17 @@ class MessageSerializer(serializers.ModelSerializer):
     sender_id = serializers.IntegerField(read_only=True)
     conversation_id = serializers.IntegerField(read_only=True)
     reply_to = serializers.SerializerMethodField()
+    reactions = serializers.SerializerMethodField()
 
     class Meta:
         model = Message
         fields = [
             'id', 'conversation_id', 'sender_id', 'client_id', 'kind', 'body', 'metadata',
-            'reply_to', 'created_at', 'edited_at', 'deleted_at',
+            'reply_to', 'reactions', 'created_at', 'edited_at', 'deleted_at',
         ]
+
+    def get_reactions(self, obj):
+        return [{'persona_id': r.persona_id, 'emoji': r.emoji} for r in obj.reactions.all()]
 
     def get_reply_to(self, obj):
         target = obj.reply_to
@@ -326,14 +330,32 @@ class ConversationSerializer(serializers.ModelSerializer):
     other_user = serializers.SerializerMethodField()
     members = serializers.SerializerMethodField()
     last_message = serializers.SerializerMethodField()
-    unread_count = serializers.IntegerField(source='unread', read_only=True)
+    unread_count = serializers.SerializerMethodField()
+    settings = serializers.SerializerMethodField()
 
     class Meta:
         model = Conversation
-        fields = ['id', 'other_user', 'members', 'last_message', 'unread_count', 'updated_at']
+        fields = ['id', 'other_user', 'members', 'last_message', 'unread_count', 'settings', 'updated_at']
 
     def _members(self, obj):
         return [m for m in obj.members.all() if m.left_at is None]
+
+    def _me(self, obj):
+        me = self.context['persona']
+        return next(m for m in obj.members.all() if m.persona_id == me.pk)
+
+    def get_unread_count(self, obj):
+        return max(obj.unread, 1 if self._me(obj).marked_unread else 0)
+
+    def get_settings(self, obj):
+        """The caller's own per-conversation settings."""
+        me = self._me(obj)
+        return {
+            'pinned': me.pinned,
+            'archived': me.archived,
+            'muted_until': me.muted_until.isoformat() if me.muted_until else None,
+            'marked_unread': me.marked_unread,
+        }
 
     def get_other_user(self, obj):
         me = self.context['persona']
@@ -353,6 +375,12 @@ class ConversationSerializer(serializers.ModelSerializer):
             'profile_picture': _first_photo_url(m.persona, self.context['request']),
             'last_read_message_id': m.last_read_message_id,
             'last_delivered_message_id': m.last_delivered_message_id,
+            # Only a persona the account is currently using shows activity.
+            'last_active_at': (
+                m.persona.last_active_at.isoformat()
+                if m.persona.last_active_at and m.persona.user.active_persona_id == m.persona_id
+                else None
+            ),
         } for m in self._members(obj)]
 
     def get_last_message(self, obj):

@@ -142,6 +142,7 @@ STATIC_ROOT = BASE_DIR / "staticfiles"
 
 MAX_UPLOAD_SIZE_MB = 10
 MAX_GALLERY_IMAGES = 6   # public photos per persona
+MAX_SAVED_PHRASES = 30
 
 # Keyed by User.TIER_* (0 = Free, 1 = Plus).
 PERSONA_LIMITS = {0: 2, 1: 12}

@@ -51,6 +51,8 @@ def mark_receipt(member: ConversationMember, kind: str, message_id: int) -> bool
             .update(**{f'{field}_id': message_id})
         )
         changed = changed or bool(updated)
+    if kind == 'read':
+        ConversationMember.objects.filter(pk=member.pk, marked_unread=True).update(marked_unread=False)
     if changed:
         broadcast(member.conversation_id, {
             'type': kind,

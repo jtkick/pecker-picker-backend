@@ -5,6 +5,7 @@ from datetime import timedelta
 from unittest import mock
 
 from asgiref.testing import ApplicationCommunicator
+from channels.db import database_sync_to_async
 from channels.layers import get_channel_layer
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import override_settings
@@ -17,7 +18,7 @@ from pecker_picker.asgi import application
 from .media import presigned_url, strip_image_metadata
 from .models import (
     Album, AlbumGrant, Block, Conversation, ConversationMember, DeviceToken, Message, Persona,
-    PersonaPhoto, ProfileImage, User,
+    PersonaPhoto, ProfileImage, Report, User,
 )
 
 
@@ -303,6 +304,109 @@ class MessagingTests(PersonaTestCase):
         self.assertFalse(DeviceToken.objects.exists())
 
 
+class MessageInteractionTests(MessagingTests):
+    def msg_url(self, mid, suffix=''):
+        return f'{self.url}{mid}/{suffix}'
+
+    def test_edit_and_unsend_only_own_within_window(self):
+        mid = self.send(self.alice, 'tpyo').data['id']
+        self.as_user(self.bob)
+        self.assertEqual(self.client.patch(self.msg_url(mid), {'body': 'x'}, format='json').status_code, 403)
+
+        self.as_user(self.alice)
+        res = self.client.patch(self.msg_url(mid), {'body': 'typo'}, format='json')
+        self.assertEqual((res.data['body'], res.data['edited_at'] is not None), ('typo', True))
+
+        Message.objects.filter(pk=mid).update(created_at=timezone.now() - timedelta(minutes=16))
+        self.assertEqual(self.client.delete(self.msg_url(mid)).status_code, 403)
+
+        mid2 = self.send(self.alice, 'oops').data['id']
+        self.client.put(self.msg_url(mid2, 'reaction/'), {'emoji': '😂'}, format='json')
+        res = self.client.delete(self.msg_url(mid2))
+        self.assertEqual((res.data['body'], res.data['reactions']), ('', []))
+        self.assertIsNotNone(res.data['deleted_at'])
+
+    def test_hide_is_per_member(self):
+        mid = self.send(self.alice, 'secret').data['id']
+        self.as_user(self.bob)
+        self.client.post(self.msg_url(mid, 'hide/'))
+        self.assertEqual(self.client.get(self.url).data, [])
+        self.as_user(self.alice)
+        self.assertEqual([m['id'] for m in self.client.get(self.url).data], [mid])
+
+    def test_reactions_set_replace_clear(self):
+        mid = self.send(self.alice, 'hi').data['id']
+        self.as_user(self.bob)
+        self.client.put(self.msg_url(mid, 'reaction/'), {'emoji': '❤️'}, format='json')
+        self.client.put(self.msg_url(mid, 'reaction/'), {'emoji': '🔥'}, format='json')
+        self.assertEqual(self.client.get(self.url).data[0]['reactions'], [{'persona_id': self.bob_main.pk, 'emoji': '🔥'}])
+        self.assertEqual(self.client.put(self.msg_url(mid, 'reaction/'), {'emoji': 'a b'}, format='json').status_code, 400)
+        self.client.delete(self.msg_url(mid, 'reaction/'))
+        self.assertEqual(self.client.get(self.url).data[0]['reactions'], [])
+
+    def test_search_and_around(self):
+        ids = [self.send(self.alice, body).data['id'] for body in ['apple pie', 'banana', 'Apple tart', 'cherry']]
+        self.as_user(self.bob)
+        self.assertEqual([m['id'] for m in self.client.get(self.url, {'q': 'apple'}).data], [ids[2], ids[0]])
+        around = self.client.get(self.url, {'around': ids[1], 'limit': 2}).data
+        self.assertEqual([m['id'] for m in around], [ids[0], ids[1], ids[2]])
+
+    def test_conversation_settings(self):
+        other = Conversation.objects.create()
+        carol, carol_main = make_user('+15550100103', 'Carol')
+        other.participants.add(self.bob_main, carol_main)
+        Conversation.objects.filter(pk=self.conv.pk).update(updated_at=timezone.now() - timedelta(days=1))
+
+        self.as_user(self.bob)
+        self.assertEqual([c['id'] for c in self.client.get('/api/conversations/').data], [other.pk, self.conv.pk])
+        res = self.client.patch(f'/api/conversations/{self.conv.pk}/', {'pinned': True, 'marked_unread': True}, format='json')
+        self.assertEqual(res.data['unread_count'], 1)
+        self.assertEqual([c['id'] for c in self.client.get('/api/conversations/').data], [self.conv.pk, other.pk])
+
+        self.client.get(self.url)   # opening the chat clears "mark unread"
+        self.assertFalse(ConversationMember.objects.get(conversation=self.conv, persona=self.bob_main).marked_unread)
+
+        self.client.patch(f'/api/conversations/{self.conv.pk}/', {'archived': True, 'muted_until': '2099-01-01T00:00:00Z'}, format='json')
+        self.send(self.alice, 'wake up')
+        self.as_user(self.bob)
+        settings = next(c for c in self.client.get('/api/conversations/').data if c['id'] == self.conv.pk)['settings']
+        self.assertFalse(settings['archived'])
+        self.assertTrue(settings['muted_until'].startswith('2099'))
+        self.assertEqual(self.client.patch(f'/api/conversations/{self.conv.pk}/', {'pinned': 'yes'}, format='json').status_code, 400)
+
+    def test_forwarded_flag(self):
+        self.assertEqual(self.send(self.alice, 'fwd', forwarded=True).data['metadata'], {'forwarded': True})
+
+    def test_saved_phrases(self):
+        self.as_user(self.alice)
+        pid = self.client.post('/api/phrases/', {'text': 'Looking?'}).data['id']
+        self.assertEqual(self.client.get('/api/phrases/').data, [{'id': pid, 'text': 'Looking?'}])
+        self.as_user(self.bob)
+        self.client.delete(f'/api/phrases/{pid}/')   # not Bob's: no effect
+        self.as_user(self.alice)
+        self.client.delete(f'/api/phrases/{pid}/')
+        self.assertEqual(self.client.get('/api/phrases/').data, [])
+
+    def test_report_with_message_evidence(self):
+        mine = self.send(self.alice, 'hello').data['id']
+        theirs = self.send(self.bob, 'rude').data['id']
+        self.as_user(self.alice)
+        data = {'persona_id': self.bob_main.pk, 'reason': 'harassment', 'message_id': mine}
+        self.assertEqual(self.client.post('/api/reports/', data).status_code, 404)
+        data['message_id'] = theirs
+        self.assertEqual(self.client.post('/api/reports/', data).status_code, 204)
+        report = Report.objects.get()
+        self.assertEqual((report.message_id, report.conversation_id), (theirs, self.conv.pk))
+
+    def test_activity_only_shown_for_active_persona(self):
+        Persona.objects.filter(pk=self.bob_main.pk).update(last_active_at=timezone.now())
+        self.as_user(self.alice)
+        bob = lambda: next(m for m in self.client.get('/api/conversations/').data[0]['members'] if m['persona_id'] == self.bob_main.pk)
+        self.assertIsNotNone(bob()['last_active_at'])
+        bob_alt = Persona.objects.create(user=self.bob, display_name='Bob Alt')
+        User.objects.filter(pk=self.bob.pk).update(active_persona=bob_alt)
+        self.assertIsNone(bob()['last_active_at'])
+
 class SocketClient(ApplicationCommunicator):
     """Minimal WebSocket test client (channels.testing needs daphne)."""
 
@@ -352,6 +456,15 @@ class ChatSocketTests(APITransactionTestCase):
         self.assertEqual(event, {'type': 'typing', 'conversation_id': self.conv.pk, 'persona_id': self.alice_main.pk})
         self.assertTrue(await alice.receive_nothing())
         await alice.disconnect()
+        await bob.disconnect()
+
+    async def test_ping_records_activity(self):
+        bob, _ = await self.connect(self.bob)
+        await database_sync_to_async(Persona.objects.filter(pk=self.bob_main.pk).update)(last_active_at=None)
+        await bob.send_json_to({'type': 'ping'})
+        self.assertTrue(await bob.receive_nothing())
+        persona = await database_sync_to_async(Persona.objects.get)(pk=self.bob_main.pk)
+        self.assertIsNotNone(persona.last_active_at)
         await bob.disconnect()
 
     async def test_server_events_reach_socket(self):

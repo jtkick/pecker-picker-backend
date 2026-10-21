@@ -1,9 +1,11 @@
 from channels.db import database_sync_to_async
 from channels.generic.websocket import AsyncJsonWebsocketConsumer
+from django.db.models import Subquery
+from django.utils import timezone
 from rest_framework_simplejwt.authentication import JWTAuthentication
 from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
 
-from .models import ConversationMember
+from .models import ConversationMember, Persona, User
 from .realtime import broadcast, mark_receipt, user_group
 
 
@@ -23,6 +25,14 @@ def _authenticate(scope):
 
 
 @database_sync_to_async
+def _touch_active_persona(user):
+    """Record activity on the persona the account is using (drives 'Active now')."""
+    # Read the active persona fresh: the user may have switched since connecting.
+    active = User.objects.filter(pk=user.pk).values('active_persona_id')[:1]
+    Persona.objects.filter(pk=Subquery(active)).update(last_active_at=timezone.now())
+
+
+@database_sync_to_async
 def _membership(user, conversation_id):
     try:
         return ConversationMember.objects.get(
@@ -35,7 +45,8 @@ def _membership(user, conversation_id):
 class ChatConsumer(AsyncJsonWebsocketConsumer):
     """
     One socket per signed-in device. Server → client: chat events (see api.realtime).
-    Client → server: `typing`, `read`, `delivered` with `conversation_id` (+ `message_id`).
+    Client → server: `typing`, `read`, `delivered` with `conversation_id` (+ `message_id`),
+    and a periodic `ping` that keeps the account's activity time fresh.
     """
 
     async def connect(self):
@@ -46,13 +57,18 @@ class ChatConsumer(AsyncJsonWebsocketConsumer):
         self.group = user_group(self.user.pk)
         await self.channel_layer.group_add(self.group, self.channel_name)
         await self.accept()
+        await _touch_active_persona(self.user)
 
     async def disconnect(self, code):
         if getattr(self, 'group', None):
             await self.channel_layer.group_discard(self.group, self.channel_name)
+            await _touch_active_persona(self.user)
 
     async def receive_json(self, content, **kwargs):
         kind = content.get('type')
+        if kind == 'ping':
+            await _touch_active_persona(self.user)
+            return
         if kind not in ('typing', 'read', 'delivered'):
             return
         member = await _membership(self.user, content.get('conversation_id'))

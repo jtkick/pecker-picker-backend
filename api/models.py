@@ -1,3 +1,5 @@
+from datetime import timedelta
+
 from django.conf import settings
 from django.contrib.auth.models import AbstractBaseUser, BaseUserManager, PermissionsMixin
 from django.db import models
@@ -263,6 +265,7 @@ class ConversationMember(models.Model):
     muted_until = models.DateTimeField(null=True, blank=True)
     archived = models.BooleanField(default=False)
     pinned = models.BooleanField(default=False)
+    marked_unread = models.BooleanField(default=False)   # cleared when the member next reads
 
     class Meta:
         unique_together = [('conversation', 'persona')]
@@ -301,12 +304,38 @@ class Message(models.Model):
     edited_at = models.DateTimeField(null=True, blank=True)
     deleted_at = models.DateTimeField(null=True, blank=True)
     expires_at = models.DateTimeField(null=True, blank=True)
+    # Members who deleted this message for themselves only.
+    hidden_for = models.ManyToManyField(Persona, related_name='+', blank=True)
+
+    # Window in which the sender may edit or unsend.
+    EDIT_WINDOW = timedelta(minutes=15)
 
     class Meta:
         ordering = ['created_at']
         constraints = [
             models.UniqueConstraint(fields=['sender', 'client_id'], name='unique_message_client_id'),
         ]
+
+
+class MessageReaction(models.Model):
+    """One emoji reaction per member per message."""
+    message = models.ForeignKey(Message, on_delete=models.CASCADE, related_name='reactions')
+    persona = models.ForeignKey(Persona, on_delete=models.CASCADE, related_name='+')
+    emoji = models.CharField(max_length=16)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = [('message', 'persona')]
+
+
+class SavedPhrase(models.Model):
+    """A user's quick reply, insertable from the chat input."""
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='saved_phrases')
+    text = models.CharField(max_length=300)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['created_at']
 
 
 class DeviceToken(models.Model):
@@ -341,6 +370,9 @@ class Report(models.Model):
     reporter = models.ForeignKey(User, on_delete=models.CASCADE, related_name='reports_given')
     reported = models.ForeignKey(User, on_delete=models.CASCADE, related_name='reports_received')
     reported_persona = models.ForeignKey(Persona, null=True, blank=True, on_delete=models.SET_NULL, related_name='+')
+    # Evidence when reporting from a chat.
+    message = models.ForeignKey('Message', null=True, blank=True, on_delete=models.SET_NULL, related_name='+')
+    conversation = models.ForeignKey('Conversation', null=True, blank=True, on_delete=models.SET_NULL, related_name='+')
     reason = models.CharField(max_length=20, choices=REASON_CHOICES)
     details = models.TextField(blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
