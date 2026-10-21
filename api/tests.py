@@ -1,9 +1,24 @@
+import io
+import json
+import uuid
 from datetime import timedelta
+from unittest import mock
 
+from asgiref.testing import ApplicationCommunicator
+from channels.layers import get_channel_layer
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.test import override_settings
 from django.utils import timezone
-from rest_framework.test import APITestCase
+from PIL import Image
+from rest_framework_simplejwt.tokens import AccessToken
+from rest_framework.test import APITestCase, APITransactionTestCase
 
-from .models import Album, AlbumGrant, Block, Conversation, Message, Persona, PersonaPhoto, ProfileImage, User
+from pecker_picker.asgi import application
+from .media import presigned_url, strip_image_metadata
+from .models import (
+    Album, AlbumGrant, Block, Conversation, ConversationMember, DeviceToken, Message, Persona,
+    PersonaPhoto, ProfileImage, User,
+)
 
 
 def make_user(phone, name, plus=False, lat=39.1, lng=-84.5):
@@ -190,3 +205,179 @@ class AlbumGrantTests(PersonaTestCase):
         res = self.client.put(url, {'image_ids': [self.private.pk, self.public.pk]}, format='json')
         self.assertEqual(res.status_code, 200)
         self.assertEqual([g['id'] for g in res.data['gallery_images']], [self.private.pk, self.public.pk])
+
+
+class MessagingTests(PersonaTestCase):
+    def setUp(self):
+        super().setUp()
+        self.conv = Conversation.objects.create()
+        self.conv.participants.add(self.alice_main, self.bob_main)
+        self.url = f'/api/conversations/{self.conv.pk}/messages/'
+
+    def send(self, user, body='hi', **extra):
+        self.as_user(user)
+        return self.client.post(self.url, {'body': body, **extra}, format='json')
+
+    def unread_for(self, user, persona):
+        self.as_user(user)
+        return {p['id']: p['unread_count'] for p in self.client.get('/api/personas/').data}[persona.pk]
+
+    def test_cursor_pagination(self):
+        ids = [self.send(self.alice, f'm{i}').data['id'] for i in range(5)]
+        self.as_user(self.bob)
+        latest = self.client.get(self.url, {'limit': 2}).data
+        self.assertEqual([m['id'] for m in latest], ids[3:])
+        older = self.client.get(self.url, {'limit': 2, 'before': ids[3]}).data
+        self.assertEqual([m['id'] for m in older], ids[1:3])
+        newer = self.client.get(self.url, {'after': ids[1]}).data
+        self.assertEqual([m['id'] for m in newer], ids[2:])
+
+    def test_client_id_makes_send_idempotent(self):
+        cid = str(uuid.uuid4())
+        first = self.send(self.alice, 'hello', client_id=cid)
+        retry = self.send(self.alice, 'hello', client_id=cid)
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(retry.status_code, 200)
+        self.assertEqual(first.data['id'], retry.data['id'])
+        self.assertEqual(Message.objects.count(), 1)
+
+    def test_reply_must_be_in_same_conversation(self):
+        other = Conversation.objects.create()
+        other.participants.add(self.alice_main, Persona.objects.create(user=self.bob, display_name='B2'))
+        foreign = Message.objects.create(conversation=other, sender=self.alice_main, body='x')
+        self.assertEqual(self.send(self.alice, 'r', reply_to_id=foreign.pk).status_code, 400)
+        target = self.send(self.bob, 'q').data
+        res = self.send(self.alice, 'r', reply_to_id=target['id'])
+        self.assertEqual(res.data['reply_to']['id'], target['id'])
+
+    def test_read_receipts_and_unread_counts(self):
+        m1 = self.send(self.alice, 'one').data['id']
+        m2 = self.send(self.alice, 'two').data['id']
+        self.assertEqual(self.unread_for(self.bob, self.bob_main), 2)
+        self.assertEqual(self.unread_for(self.alice, self.alice_main), 0)
+
+        self.as_user(self.bob)
+        self.client.post(f'/api/conversations/{self.conv.pk}/read/', {'message_id': m1})
+        self.assertEqual(self.unread_for(self.bob, self.bob_main), 1)
+        # Receipts never move backwards.
+        self.client.post(f'/api/conversations/{self.conv.pk}/read/', {'message_id': m2})
+        self.client.post(f'/api/conversations/{self.conv.pk}/read/', {'message_id': m1})
+        self.assertEqual(ConversationMember.objects.get(persona=self.bob_main).last_read_message_id, m2)
+
+        self.as_user(self.alice)
+        conv = self.client.get('/api/conversations/').data[0]
+        bob = next(m for m in conv['members'] if m['persona_id'] == self.bob_main.pk)
+        self.assertEqual((bob['last_read_message_id'], bob['last_delivered_message_id']), (m2, m2))
+        self.assertEqual(conv['last_message']['id'], m2)
+
+    def test_opening_chat_marks_read_but_paging_does_not(self):
+        ids = [self.send(self.alice, f'm{i}').data['id'] for i in range(3)]
+        self.as_user(self.bob)
+        self.client.get(self.url, {'before': ids[2]})
+        self.assertEqual(self.unread_for(self.bob, self.bob_main), 3)
+        self.client.get(self.url)
+        self.assertEqual(self.unread_for(self.bob, self.bob_main), 0)
+
+    def test_blocked_user_cannot_send(self):
+        Block.objects.create(blocker=self.bob, blocked=self.alice)
+        self.assertEqual(self.send(self.alice).status_code, 403)
+
+    def test_send_broadcasts_to_members(self):
+        with self.captureOnCommitCallbacks(execute=False) as callbacks:
+            self.send(self.alice, 'ping')
+        with mock.patch('api.realtime.send_to_users') as send:
+            for cb in callbacks:
+                cb()
+        user_ids, payload = send.call_args.args
+        self.assertEqual(user_ids, {self.alice.pk, self.bob.pk})
+        self.assertEqual(payload['type'], 'message.new')
+        self.assertEqual(payload['message']['body'], 'ping')
+
+    def test_device_registration(self):
+        self.as_user(self.alice)
+        self.assertEqual(self.client.post('/api/devices/', {'token': 't1', 'platform': 'ios'}).status_code, 204)
+        self.as_user(self.bob)
+        self.client.post('/api/devices/', {'token': 't1', 'platform': 'ios'})
+        self.assertEqual(DeviceToken.objects.get(token='t1').user, self.bob)
+        self.client.delete('/api/devices/', {'token': 't1'})
+        self.assertFalse(DeviceToken.objects.exists())
+
+
+class SocketClient(ApplicationCommunicator):
+    """Minimal WebSocket test client (channels.testing needs daphne)."""
+
+    def __init__(self, headers=()):
+        super().__init__(application, {
+            'type': 'websocket', 'path': '/ws/chat/', 'headers': list(headers),
+            'query_string': b'', 'subprotocols': [],
+        })
+
+    async def connect(self):
+        await self.send_input({'type': 'websocket.connect'})
+        return (await self.receive_output(1))['type'] == 'websocket.accept'
+
+    async def send_json_to(self, data):
+        await self.send_input({'type': 'websocket.receive', 'text': json.dumps(data)})
+
+    async def receive_json_from(self):
+        return json.loads((await self.receive_output(1))['text'])
+
+    async def disconnect(self):
+        await self.send_input({'type': 'websocket.disconnect', 'code': 1000})
+        await self.wait(1)
+
+
+class ChatSocketTests(APITransactionTestCase):
+    # Transactional so on_commit fan-out actually runs.
+    def setUp(self):
+        self.alice, self.alice_main = make_user('+15550100101', 'Alice')
+        self.bob, self.bob_main = make_user('+15550100102', 'Bob')
+        self.conv = Conversation.objects.create()
+        self.conv.participants.add(self.alice_main, self.bob_main)
+
+    async def connect(self, user):
+        token = str(AccessToken.for_user(user))
+        comm = SocketClient(headers=[(b'authorization', f'Bearer {token}'.encode())])
+        return comm, await comm.connect()
+
+    async def test_rejects_missing_token(self):
+        self.assertFalse(await SocketClient().connect())
+
+    async def test_typing_relayed_to_other_member_only(self):
+        alice, ok_a = await self.connect(self.alice)
+        bob, ok_b = await self.connect(self.bob)
+        self.assertTrue(ok_a and ok_b)
+        await alice.send_json_to({'type': 'typing', 'conversation_id': self.conv.pk})
+        event = await bob.receive_json_from()
+        self.assertEqual(event, {'type': 'typing', 'conversation_id': self.conv.pk, 'persona_id': self.alice_main.pk})
+        self.assertTrue(await alice.receive_nothing())
+        await alice.disconnect()
+        await bob.disconnect()
+
+    async def test_server_events_reach_socket(self):
+        bob, _ = await self.connect(self.bob)
+        await get_channel_layer().group_send(f'user_{self.bob.pk}', {'type': 'chat.event', 'payload': {'type': 'x'}})
+        self.assertEqual(await bob.receive_json_from(), {'type': 'x'})
+        await bob.disconnect()
+
+
+class MediaTests(APITestCase):
+    @override_settings(
+        MEDIA_PUBLIC_URL='http://media.example:9010', AWS_STORAGE_BUCKET_NAME='b',
+        AWS_ACCESS_KEY_ID='k', AWS_SECRET_ACCESS_KEY='s', MEDIA_URL_EXPIRY_SECONDS=3600,
+    )
+    def test_presigned_url_stable_within_window(self):
+        url = presigned_url('gallery/a b.jpg', now=1_000_000_000)
+        self.assertTrue(url.startswith('http://media.example:9010/b/gallery/a%20b.jpg?'))
+        self.assertIn('X-Amz-Expires=3600', url)
+        self.assertEqual(url, presigned_url('gallery/a b.jpg', now=1_000_000_000 + 60))
+        self.assertNotEqual(url, presigned_url('gallery/a b.jpg', now=1_000_000_000 + 3600))
+
+    def test_strip_image_metadata_removes_exif(self):
+        exif = Image.Exif()
+        exif[0x010F] = 'PhoneMaker'
+        buf = io.BytesIO()
+        Image.new('RGB', (4, 4)).save(buf, format='JPEG', exif=exif)
+        clean = strip_image_metadata(SimpleUploadedFile('p.jpg', buf.getvalue()))
+        self.assertEqual(dict(Image.open(clean).getexif()), {})
+        self.assertIsNone(strip_image_metadata(SimpleUploadedFile('x.jpg', b'not an image')))

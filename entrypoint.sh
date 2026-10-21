@@ -25,9 +25,9 @@ python manage.py migrate --noinput
 echo "Collecting static files..."
 python manage.py collectstatic --noinput
 
-echo "Ensuring bucket exists and is public..."
+echo "Ensuring bucket exists and is private..."
 python - <<'EOF'
-import boto3, json, os
+import boto3, os
 
 s3 = boto3.client(
     's3',
@@ -45,23 +45,17 @@ except s3.exceptions.BucketAlreadyOwnedByYou:
 except Exception as e:
     print(f"Bucket setup note: {e}")
 
-policy = json.dumps({
-    "Version": "2012-10-17",
-    "Statement": [{
-        "Effect": "Allow",
-        "Principal": {"AWS": ["*"]},
-        "Action": ["s3:GetObject"],
-        "Resource": [f"arn:aws:s3:::{bucket}/*"],
-    }],
-})
-s3.put_bucket_policy(Bucket=bucket, Policy=policy)
-print("Bucket policy set to public read.")
+# Media is served only through presigned URLs (api.media.presigned_url),
+# so drop any public-read policy left from earlier setups.
+try:
+    s3.delete_bucket_policy(Bucket=bucket)
+    print("Bucket policy removed (private).")
+except Exception as e:
+    print(f"Bucket policy note: {e}")
 EOF
 
-echo "Starting gunicorn..."
-exec gunicorn pecker_picker.wsgi:application \
-    --bind 0.0.0.0:3425 \
-    --workers 2 \
-    --timeout 60 \
-    --access-logfile - \
-    --error-logfile -
+echo "Starting uvicorn..."
+exec uvicorn pecker_picker.asgi:application \
+    --host 0.0.0.0 \
+    --port 3425 \
+    --workers 2

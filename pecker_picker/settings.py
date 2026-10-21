@@ -65,12 +65,42 @@ WSGI_APPLICATION = "pecker_picker.wsgi.application"
 # Database
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
 
-DATABASES = {
-    "default": {
-        "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
+# Postgres when POSTGRES_DB is set; otherwise the local SQLite file.
+if os.environ.get("POSTGRES_DB"):
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": os.environ["POSTGRES_DB"],
+            "USER": os.environ.get("POSTGRES_USER", "postgres"),
+            "PASSWORD": os.environ.get("POSTGRES_PASSWORD", ""),
+            "HOST": os.environ.get("POSTGRES_HOST", "postgres"),
+            "PORT": os.environ.get("POSTGRES_PORT", "5432"),
+            "CONN_MAX_AGE": 60,
+        }
     }
+else:
+    DATABASES = {
+        "default": {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": BASE_DIR / "db.sqlite3",
+        }
+    }
+
+# ── Realtime (Django Channels) ────────────────────────────────────────────────
+# Redis is required once more than one server process runs; the in-memory
+# layer only reaches sockets in the same process.
+REDIS_URL = os.environ.get("REDIS_URL", "")
+CHANNEL_LAYERS = {
+    "default": (
+        {"BACKEND": "channels_redis.core.RedisChannelLayer", "CONFIG": {"hosts": [REDIS_URL]}}
+        if REDIS_URL else
+        {"BACKEND": "channels.layers.InMemoryChannelLayer"}
+    ),
 }
+
+# ── Push notifications (Firebase Cloud Messaging) ─────────────────────────────
+# Path to a Firebase service-account JSON. Leave blank to disable push.
+FIREBASE_CREDENTIALS_FILE = os.environ.get("FIREBASE_CREDENTIALS_FILE", "")
 
 
 # Password validation
@@ -131,8 +161,11 @@ AWS_ACCESS_KEY_ID = os.environ.get("MINIO_ACCESS_KEY", "peckeradmin")
 AWS_SECRET_ACCESS_KEY = os.environ.get("MINIO_SECRET_KEY", "ChangeMeNow123!")
 AWS_STORAGE_BUCKET_NAME = os.environ.get("MINIO_BUCKET", "pecker-picker")
 AWS_S3_ADDRESSING_STYLE = "path"   # MinIO requires path-style; S3 uses virtual-hosted
-AWS_DEFAULT_ACL = None             # Rely on bucket policy for public read
-AWS_QUERYSTRING_AUTH = False       # Public URLs — no signed query strings needed
+AWS_S3_REGION_NAME = os.environ.get("MINIO_REGION", "us-east-1")
+AWS_DEFAULT_ACL = None             # Bucket is private; clients get presigned URLs
+
+# Lifetime of presigned media URLs (see api.media.presigned_url).
+MEDIA_URL_EXPIRY_SECONDS = int(os.environ.get("MEDIA_URL_EXPIRY_SECONDS", 6 * 60 * 60))
 
 # Public base URL returned to clients so they can load images directly.
 # For MinIO: http://triangulum.cc:9010
@@ -157,6 +190,9 @@ REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
         "rest_framework_simplejwt.authentication.JWTAuthentication",
     ],
+    "DEFAULT_THROTTLE_RATES": {
+        "messages": "60/min",
+    },
 }
 
 from datetime import timedelta

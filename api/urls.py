@@ -45,6 +45,8 @@ urlpatterns = [
     path("webhooks/stripe/", stripe_views.stripe_webhook, name="stripe-webhook"),
     path("conversations/", views.conversations, name="conversations"),
     path("conversations/<int:pk>/messages/", views.conversation_messages, name="conversation-messages"),
+    path("conversations/<int:pk>/read/", views.conversation_read, name="conversation-read"),
+    path("devices/", views.devices, name="devices"),
     path("kinks/", views.kinks_list, name="kinks-list"),
     path("interests/", views.interests_list, name="interests-list"),
 ]

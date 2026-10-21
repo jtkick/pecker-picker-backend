@@ -236,7 +236,7 @@ class LocationShareGrant(models.Model):
 
 
 class Conversation(models.Model):
-    participants = models.ManyToManyField(Persona, related_name='conversations')
+    participants = models.ManyToManyField(Persona, through='ConversationMember', related_name='conversations')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(default=timezone.now)
 
@@ -244,19 +244,79 @@ class Conversation(models.Model):
         ordering = ['-updated_at']
 
 
+class ConversationMember(models.Model):
+    """A persona's membership in a conversation, with its per-member read/delivery state."""
+    ROLE_MEMBER, ROLE_ADMIN, ROLE_OWNER = 0, 1, 2
+    ROLE_CHOICES = [(ROLE_MEMBER, 'Member'), (ROLE_ADMIN, 'Admin'), (ROLE_OWNER, 'Owner')]
+
+    conversation = models.ForeignKey(Conversation, on_delete=models.CASCADE, related_name='members')
+    persona = models.ForeignKey(Persona, on_delete=models.CASCADE, related_name='memberships')
+    role = models.SmallIntegerField(choices=ROLE_CHOICES, default=ROLE_MEMBER)
+    joined_at = models.DateTimeField(default=timezone.now)
+    left_at = models.DateTimeField(null=True, blank=True)
+    last_read_message = models.ForeignKey(
+        'Message', null=True, blank=True, on_delete=models.SET_NULL, related_name='+',
+    )
+    last_delivered_message = models.ForeignKey(
+        'Message', null=True, blank=True, on_delete=models.SET_NULL, related_name='+',
+    )
+    muted_until = models.DateTimeField(null=True, blank=True)
+    archived = models.BooleanField(default=False)
+    pinned = models.BooleanField(default=False)
+
+    class Meta:
+        unique_together = [('conversation', 'persona')]
+
+    def is_muted(self):
+        return self.muted_until is not None and timezone.now() < self.muted_until
+
+
 class Message(models.Model):
+    KIND_TEXT = 'text'
+    KIND_CHOICES = [
+        (KIND_TEXT, 'Text'),
+        ('image', 'Image'),
+        ('video', 'Video'),
+        ('voice', 'Voice'),
+        ('album', 'Album'),
+        ('location', 'Location'),
+        ('live_location', 'Live location'),
+        ('profile', 'Profile'),
+        ('system', 'System'),
+    ]
+
     conversation = models.ForeignKey(
         Conversation, on_delete=models.CASCADE, related_name='messages'
     )
     sender = models.ForeignKey(
         Persona, on_delete=models.CASCADE, related_name='sent_messages'
     )
-    body = models.TextField(max_length=2000)
+    kind = models.CharField(max_length=20, choices=KIND_CHOICES, default=KIND_TEXT)
+    body = models.TextField(max_length=2000, blank=True)
+    metadata = models.JSONField(default=dict, blank=True)   # per-kind payload
+    # Client-generated id so a retried send never creates a duplicate.
+    client_id = models.UUIDField(null=True, blank=True)
+    reply_to = models.ForeignKey('self', null=True, blank=True, on_delete=models.SET_NULL, related_name='+')
     created_at = models.DateTimeField(auto_now_add=True)
-    is_read = models.BooleanField(default=False)
+    edited_at = models.DateTimeField(null=True, blank=True)
+    deleted_at = models.DateTimeField(null=True, blank=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ['created_at']
+        constraints = [
+            models.UniqueConstraint(fields=['sender', 'client_id'], name='unique_message_client_id'),
+        ]
+
+
+class DeviceToken(models.Model):
+    """A push-notification (FCM) registration token for one of the user's devices."""
+    PLATFORM_CHOICES = [('ios', 'iOS'), ('android', 'Android')]
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='device_tokens')
+    token = models.CharField(max_length=512, unique=True)
+    platform = models.CharField(max_length=10, choices=PLATFORM_CHOICES)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
 
 class Block(models.Model):

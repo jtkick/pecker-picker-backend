@@ -289,26 +289,55 @@ class LocationShareGrantSerializer(serializers.ModelSerializer):
 
 
 class MessageSerializer(serializers.ModelSerializer):
-    sender_id = serializers.IntegerField(source='sender.id', read_only=True)
+    sender_id = serializers.IntegerField(read_only=True)
+    conversation_id = serializers.IntegerField(read_only=True)
+    reply_to = serializers.SerializerMethodField()
 
     class Meta:
         model = Message
-        fields = ['id', 'sender_id', 'body', 'created_at', 'is_read']
-        read_only_fields = ['id', 'sender_id', 'created_at', 'is_read']
+        fields = [
+            'id', 'conversation_id', 'sender_id', 'client_id', 'kind', 'body', 'metadata',
+            'reply_to', 'created_at', 'edited_at', 'deleted_at',
+        ]
+
+    def get_reply_to(self, obj):
+        target = obj.reply_to
+        if target is None:
+            return None
+        deleted = target.deleted_at is not None
+        return {
+            'id': target.id,
+            'sender_id': target.sender_id,
+            'kind': target.kind,
+            'body': '' if deleted else target.body[:200],
+            'deleted': deleted,
+        }
+
+    def to_representation(self, obj):
+        data = super().to_representation(obj)
+        if obj.deleted_at is not None:
+            data['body'] = ''
+            data['metadata'] = {}
+        return data
 
 
 class ConversationSerializer(serializers.ModelSerializer):
+    """Expects the queryset from views._conversation_qs (members, latest message, unread annotated)."""
     other_user = serializers.SerializerMethodField()
+    members = serializers.SerializerMethodField()
     last_message = serializers.SerializerMethodField()
-    unread_count = serializers.SerializerMethodField()
+    unread_count = serializers.IntegerField(source='unread', read_only=True)
 
     class Meta:
         model = Conversation
-        fields = ['id', 'other_user', 'last_message', 'unread_count', 'updated_at']
+        fields = ['id', 'other_user', 'members', 'last_message', 'unread_count', 'updated_at']
+
+    def _members(self, obj):
+        return [m for m in obj.members.all() if m.left_at is None]
 
     def get_other_user(self, obj):
         me = self.context['persona']
-        other = next((p for p in obj.participants.all() if p.pk != me.pk), None)
+        other = next((m.persona for m in self._members(obj) if m.persona_id != me.pk), None)
         if other is None:
             return None
         return {
@@ -317,22 +346,24 @@ class ConversationSerializer(serializers.ModelSerializer):
             'profile_picture': _first_photo_url(other, self.context['request']),
         }
 
+    def get_members(self, obj):
+        return [{
+            'persona_id': m.persona_id,
+            'display_name': m.persona.display_name,
+            'profile_picture': _first_photo_url(m.persona, self.context['request']),
+            'last_read_message_id': m.last_read_message_id,
+            'last_delivered_message_id': m.last_delivered_message_id,
+        } for m in self._members(obj)]
+
     def get_last_message(self, obj):
-        if hasattr(obj, 'prefetched_messages'):
-            msgs = obj.prefetched_messages
-            msg = msgs[0] if msgs else None
-        else:
-            msg = obj.messages.order_by('-created_at').first()
+        msg = obj.latest[0] if obj.latest else None
         if msg is None:
             return None
         return {
-            'body': msg.body,
+            'id': msg.id,
+            'kind': msg.kind,
+            'body': '' if msg.deleted_at else msg.body,
             'sender_id': msg.sender_id,
             'created_at': msg.created_at.isoformat(),
+            'deleted': msg.deleted_at is not None,
         }
-
-    def get_unread_count(self, obj):
-        me = self.context['persona']
-        if hasattr(obj, 'prefetched_messages'):
-            return sum(1 for m in obj.prefetched_messages if not m.is_read and m.sender_id != me.pk)
-        return obj.messages.filter(is_read=False).exclude(sender=me).count()

@@ -11,12 +11,14 @@ logger = logging.getLogger(__name__)
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from rest_framework import status
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework.decorators import api_view, permission_classes, throttle_classes
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
+from rest_framework.throttling import UserRateThrottle
 from rest_framework_simplejwt.tokens import RefreshToken
-from django.db import transaction
-from django.db.models import Count, F, Prefetch, Q
+from django.db import IntegrityError, transaction
+from django.db.models import Count, F, OuterRef, Prefetch, Q, Subquery
+from django.db.models.functions import Coalesce
 
 from rest_framework_simplejwt.exceptions import TokenError
 from webauthn import (
@@ -34,7 +36,7 @@ from webauthn.helpers.structs import (
     UserVerificationRequirement,
     AttestationConveyancePreference,
 )
-from .models import User, Persona, PersonaPhoto, ProfileImage, Album, AlbumGrant, Conversation, Message, LocationShareGrant, Block, Report, FaceVerification, Kink, Interest, PasskeyCredential, WebAuthnChallenge, OTPVerification
+from .models import User, Persona, PersonaPhoto, ProfileImage, Album, AlbumGrant, Conversation, ConversationMember, DeviceToken, Message, LocationShareGrant, Block, Report, FaceVerification, Kink, Interest, PasskeyCredential, WebAuthnChallenge, OTPVerification
 from .sms import send_otp_sms, send_verify_sms, check_verify_sms
 from .serializers import (
     AccountSerializer, PersonaSummarySerializer, PersonaSerializer,
@@ -43,6 +45,9 @@ from .serializers import (
 )
 from .geocoding import reverse_geocode, nearby_label
 from .tagging import auto_tag
+from .media import strip_image_metadata
+from .push import notify_new_message
+from .realtime import broadcast, mark_receipt
 from django.conf import settings
 
 
@@ -503,17 +508,21 @@ def _visible_persona(request, pk):
 
 def _unread_counts(user) -> dict[int, int]:
     """Unread incoming messages per persona owned by `user`."""
+    counts = dict.fromkeys(user.personas.values_list('pk', flat=True), 0)
     rows = (
-        Persona.objects
-        .filter(user=user)
+        ConversationMember.objects
+        .filter(persona__user=user, left_at__isnull=True)
         .annotate(unread=Count(
-            'conversations__messages',
-            filter=Q(conversations__messages__is_read=False)
-            & ~Q(conversations__messages__sender_id=F('pk')),
+            'conversation__messages',
+            filter=Q(conversation__messages__id__gt=Coalesce(F('last_read_message_id'), 0))
+            & ~Q(conversation__messages__sender_id=F('persona_id'))
+            & Q(conversation__messages__deleted_at__isnull=True),
         ))
-        .values_list('pk', 'unread')
+        .values_list('persona_id', 'unread')
     )
-    return dict(rows)
+    for persona_id, unread in rows:
+        counts[persona_id] += unread
+    return counts
 
 
 def _persona_ctx(request):
@@ -684,8 +693,10 @@ def photos(request):
     image, err = _validate_image(request)
     if err:
         return err
-
-    # Read bytes before the storage backend moves the file pointer.
+    # Re-encode without EXIF so location/device metadata never reaches other users.
+    image = strip_image_metadata(image)
+    if image is None:
+        return Response({'detail': 'Unsupported image format.'}, status=status.HTTP_400_BAD_REQUEST)
     image_bytes = image.read()
     image.seek(0)
 
@@ -924,21 +935,66 @@ def location_grant_delete(request, pk):
 
 # ── Conversations ─────────────────────────────────────────────────────────────
 
+def _conversation_qs(me):
+    """My active persona's conversations, with members, latest message and unread count."""
+    my_last_read = ConversationMember.objects.filter(
+        conversation=OuterRef('pk'), persona=me,
+    ).values('last_read_message_id')[:1]
+    unread = (
+        Message.objects
+        .filter(conversation=OuterRef('pk'), deleted_at__isnull=True)
+        .filter(id__gt=Coalesce(OuterRef('my_last_read'), 0))
+        .exclude(sender=me)
+        .order_by()
+        .values('conversation')
+        .annotate(n=Count('id'))
+        .values('n')
+    )
+    members = ConversationMember.objects.select_related('persona').prefetch_related(
+        Prefetch('persona__photos', queryset=PersonaPhoto.objects.select_related('image')),
+    )
+    return (
+        Conversation.objects
+        .filter(members__persona=me, members__left_at__isnull=True)
+        .annotate(my_last_read=Subquery(my_last_read))
+        .annotate(unread=Coalesce(Subquery(unread), 0))
+        .prefetch_related(
+            Prefetch('members', queryset=members),
+            Prefetch('messages', queryset=Message.objects.order_by('-id')[:1], to_attr='latest'),
+        )
+        .order_by('-updated_at')
+    )
+
+
+def _my_membership(request, pk):
+    me = request.user.get_active_persona()
+    return get_object_or_404(
+        ConversationMember.objects.select_related('conversation'),
+        conversation_id=pk, persona=me, left_at__isnull=True,
+    )
+
+
+def _int_param(request, name, default=None, maximum=None):
+    try:
+        value = int(request.query_params[name])
+    except (KeyError, ValueError):
+        return default
+    return min(value, maximum) if maximum is not None else value
+
+
+class MessageSendThrottle(UserRateThrottle):
+    scope = 'messages'
+
+    def allow_request(self, request, view):
+        return request.method != 'POST' or super().allow_request(request, view)
+
+
 @api_view(['GET', 'POST'])
 def conversations(request):
     me = request.user.get_active_persona()
     ctx = {'request': request, 'persona': me}
     if request.method == 'GET':
-        qs = (
-            Conversation.objects
-            .filter(participants=me)
-            .prefetch_related(
-                Prefetch('participants', queryset=Persona.objects.prefetch_related(_photos_prefetch())),
-                Prefetch('messages', queryset=Message.objects.order_by('-created_at'), to_attr='prefetched_messages'),
-            )
-            .order_by('-updated_at')
-        )
-        return Response(ConversationSerializer(qs, many=True, context=ctx).data)
+        return Response(ConversationSerializer(_conversation_qs(me), many=True, context=ctx).data)
 
     # POST — get or create a 1:1 conversation between my active persona and another persona
     other = _visible_persona(request, request.data.get('persona_id'))
@@ -957,30 +1013,112 @@ def conversations(request):
         conv.participants.add(me, other)
 
     return Response(
-        ConversationSerializer(conv, context=ctx).data,
+        ConversationSerializer(_conversation_qs(me).get(pk=conv.pk), context=ctx).data,
         status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
     )
 
 
 @api_view(['GET', 'POST'])
+@throttle_classes([MessageSendThrottle])
 def conversation_messages(request, pk):
-    me = request.user.get_active_persona()
-    conv = get_object_or_404(Conversation, pk=pk, participants=me)
+    member = _my_membership(request, pk)
+    me, conv = member.persona, member.conversation
 
     if request.method == 'GET':
-        # Mark all incoming messages as read.
-        conv.messages.filter(is_read=False).exclude(sender=me).update(is_read=True)
-        msgs = conv.messages.all()
+        # Cursor pagination, always returned oldest-first:
+        #   ?before=<id>  older page (scrolling up)
+        #   ?after=<id>   everything newer (catch-up after a reconnect)
+        #   neither       the latest page — opening the chat marks it read
+        limit = max(_int_param(request, 'limit', 50, maximum=100), 1)
+        before = _int_param(request, 'before')
+        after = _int_param(request, 'after')
+        qs = conv.messages.select_related('reply_to')
+        if after is not None:
+            msgs = list(qs.filter(id__gt=after).order_by('id')[:limit])
+        else:
+            if before is not None:
+                qs = qs.filter(id__lt=before)
+            msgs = list(qs.order_by('-id')[:limit])[::-1]
+        if msgs and before is None:
+            mark_receipt(member, 'delivered' if after is not None else 'read', msgs[-1].id)
         return Response(MessageSerializer(msgs, many=True).data)
 
     # POST — send a message
+    client_id = request.data.get('client_id')
+    if client_id is not None:
+        try:
+            client_id = uuid.UUID(str(client_id))
+        except ValueError:
+            return Response({'error': 'Invalid client_id.'}, status=status.HTTP_400_BAD_REQUEST)
+        existing = Message.objects.filter(sender=me, client_id=client_id).first()
+        if existing is not None:
+            return Response(MessageSerializer(existing).data, status=status.HTTP_200_OK)
+
     body = (request.data.get('body') or '').strip()
     if not body:
         return Response({'error': 'Message body is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
-    msg = Message.objects.create(conversation=conv, sender=me, body=body)
+    reply_to = None
+    if request.data.get('reply_to_id') is not None:
+        try:
+            reply_to = conv.messages.get(pk=request.data.get('reply_to_id'))
+        except (Message.DoesNotExist, TypeError, ValueError):
+            return Response({'error': 'Unknown reply_to_id.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    other_users = (
+        conv.members.filter(left_at__isnull=True).exclude(persona=me).values_list('persona__user_id', flat=True)
+    )
+    if Block.objects.filter(
+        Q(blocker=request.user, blocked__in=other_users) | Q(blocker__in=other_users, blocked=request.user)
+    ).exists():
+        return Response({'error': 'You can no longer message this user.'}, status=status.HTTP_403_FORBIDDEN)
+
+    try:
+        with transaction.atomic():
+            msg = Message.objects.create(
+                conversation=conv, sender=me, body=body, client_id=client_id, reply_to=reply_to,
+            )
+    except IntegrityError:
+        # A concurrent retry with the same client_id won the race.
+        return Response(MessageSerializer(Message.objects.get(sender=me, client_id=client_id)).data)
+
     Conversation.objects.filter(pk=conv.pk).update(updated_at=timezone.now())
-    return Response(MessageSerializer(msg).data, status=status.HTTP_201_CREATED)
+    # Your own messages are read by you.
+    ConversationMember.objects.filter(pk=member.pk).update(last_read_message=msg, last_delivered_message=msg)
+    data = MessageSerializer(msg).data
+    broadcast(conv.pk, {'type': 'message.new', 'conversation_id': conv.pk, 'message': data})
+    notify_new_message(msg)
+    return Response(data, status=status.HTTP_201_CREATED)
+
+
+@api_view(['POST'])
+def conversation_read(request, pk):
+    """Mark the conversation read up to `message_id`."""
+    member = _my_membership(request, pk)
+    try:
+        message_id = int(request.data.get('message_id'))
+    except (TypeError, ValueError):
+        return Response({'error': 'message_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
+    mark_receipt(member, 'read', message_id)
+    return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+@api_view(['POST', 'DELETE'])
+def devices(request):
+    """Register (POST) or unregister (DELETE) this device's push token."""
+    token = (request.data.get('token') or '').strip()
+    if not token or len(token) > 512:
+        return Response({'error': 'token is required.'}, status=status.HTTP_400_BAD_REQUEST)
+    if request.method == 'DELETE':
+        DeviceToken.objects.filter(user=request.user, token=token).delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    platform = request.data.get('platform')
+    if platform not in ('ios', 'android'):
+        return Response({'error': 'platform must be ios or android.'}, status=status.HTTP_400_BAD_REQUEST)
+    # A token belongs to one device; it moves to whoever signed in on it last.
+    DeviceToken.objects.update_or_create(token=token, defaults={'user': request.user, 'platform': platform})
+    return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 @api_view(["GET"])
