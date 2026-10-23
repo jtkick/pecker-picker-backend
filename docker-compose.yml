@@ -19,6 +19,21 @@ services:
       retries: 10
       start_period: 5s
 
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - ${HOME}/postgres/data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   redis:
     image: redis:7-alpine
     restart: unless-stopped
@@ -40,9 +55,11 @@ services:
       # Channel layer for realtime chat across server processes.
       REDIS_URL: redis://redis:6379/0
     volumes:
-      # Persist the SQLite DB on the host so it survives container rebuilds.
+      # The old SQLite DB, kept as a fallback (used only when POSTGRES_DB is unset).
       - ./db.sqlite3:/app/db.sqlite3
     depends_on:
+      postgres:
+        condition: service_healthy
       minio:
         condition: service_healthy
       redis:

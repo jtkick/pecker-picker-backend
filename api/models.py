@@ -44,8 +44,8 @@ class User(AbstractBaseUser, PermissionsMixin):
         'Persona', null=True, blank=True, on_delete=models.SET_NULL, related_name='+',
     )
 
-    latitude = models.FloatField(null=True, blank=True)
-    longitude = models.FloatField(null=True, blank=True)
+    latitude = models.FloatField(null=True, blank=True, db_index=True)
+    longitude = models.FloatField(null=True, blank=True, db_index=True)
     location_updated_at = models.DateTimeField(null=True, blank=True)
     neighborhood = models.CharField(max_length=100, blank=True)
 
@@ -143,7 +143,9 @@ class Persona(models.Model):
     color_start = models.PositiveIntegerField(default=0xE53935, validators=[MaxValueValidator(0xFFFFFF)])
     color_end = models.PositiveIntegerField(default=0xF9A825, validators=[MaxValueValidator(0xFFFFFF)])
     created_at = models.DateTimeField(auto_now_add=True)
-    last_active_at = models.DateTimeField(null=True, blank=True)
+    last_active_at = models.DateTimeField(null=True, blank=True, db_index=True)
+    # The discover filters this persona browses with (see api.discover.clean_filters).
+    discover_filters = models.JSONField(default=dict, blank=True)
 
     display_name = models.CharField(max_length=50, blank=True)
     bio = models.TextField(max_length=300, blank=True)
@@ -182,7 +184,7 @@ class Persona(models.Model):
         'display_name', 'bio', 'age', 'intent',
         'looking_for_chat', 'looking_for_cuddle', 'looking_for_fool_around', 'looking_for_sex',
         'location_sharing', 'position', 'is_side', 'power_position', 'show_pronouns', 'show_height', 'show_length',
-        'kinks', 'interests', 'relationship_types', 'can_host', 'can_travel',
+        'kinks', 'interests', 'relationship_types', 'can_host', 'can_travel', 'discover_filters',
     ]
 
     class Meta:
@@ -190,6 +192,18 @@ class Persona(models.Model):
 
     def __str__(self):
         return self.display_name or f'Persona {self.pk}'
+
+
+class DiscoverEvent(models.Model):
+    """A viewer acting on a profile they found in discover; used to tune ranking weights."""
+    KIND_OPENED, KIND_MESSAGED = 'opened', 'messaged'
+
+    viewer_persona = models.ForeignKey('Persona', on_delete=models.CASCADE, related_name='+')
+    target_persona = models.ForeignKey('Persona', on_delete=models.CASCADE, related_name='+')
+    kind = models.CharField(max_length=10, choices=[(KIND_OPENED, 'Opened'), (KIND_MESSAGED, 'Messaged')])
+    rank = models.PositiveIntegerField()        # 0-based position in the feed
+    sort = models.CharField(max_length=12, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
 
 
 class PersonaMember(models.Model):

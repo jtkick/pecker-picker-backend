@@ -92,6 +92,15 @@ else:
 REDIS_URL = os.environ.get("REDIS_URL", "")
 # redis-py 8 defaults socket_timeout to 5s, the same as channels_redis's
 # blocking BZPOPMIN wait, so idle reads time out before Redis replies.
+# Shared across server processes (discover feed snapshots); per-process memory without Redis.
+CACHES = {
+    "default": (
+        {"BACKEND": "django.core.cache.backends.redis.RedisCache", "LOCATION": REDIS_URL}
+        if REDIS_URL else
+        {"BACKEND": "django.core.cache.backends.locmem.LocMemCache"}
+    ),
+}
+
 CHANNEL_LAYERS = {
     "default": (
         {
@@ -199,6 +208,7 @@ REST_FRAMEWORK = {
     ],
     "DEFAULT_THROTTLE_RATES": {
         "messages": "60/min",
+        "discover": "60/min",
     },
 }
 

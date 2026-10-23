@@ -1,9 +1,10 @@
-import random as _random
 import phonenumbers
 from django.db.models import Q
 from django.utils import timezone
 from rest_framework import serializers
 from .models import User, Persona, PersonaMember, ProfileImage, Album, AlbumGrant, Conversation, Message, LocationShareGrant, FaceVerification
+from . import discover
+from .geo import fuzz_coords
 from .membership import in_use
 
 
@@ -17,12 +18,6 @@ def normalize_phone(value: str) -> str:
         raise serializers.ValidationError(
             "Invalid phone number format. Use E.164 format (e.g. +15551234567)."
         )
-
-
-def _fuzz_coords(lat: float, lng: float, seed: int) -> tuple[float, float]:
-    """Return a deterministically jittered position (~±450 m) for General-mode users."""
-    rng = _random.Random(seed)
-    return lat + rng.uniform(-0.004, 0.004), lng + rng.uniform(-0.004, 0.004)
 
 
 def _image_url(image: ProfileImage, request) -> str:
@@ -79,7 +74,7 @@ def _location_at_level(persona, level: int, coord: int) -> float | None:
     if level == 2:
         return (user.latitude, user.longitude)[coord]
     if level == 1:
-        return _fuzz_coords(user.latitude, user.longitude, persona.pk)[coord]
+        return fuzz_coords(user.latitude, user.longitude, persona.pk)[coord]
     return None
 
 
@@ -181,9 +176,20 @@ class PersonaSummarySerializer(serializers.ModelSerializer):
         return self.context.get('unread_counts', {}).get(obj.pk, 0)
 
 
+def persona_verified(persona) -> bool:
+    """A solo persona is verified with its account; a group when every member is."""
+    if persona.group_type:
+        members = _accepted_members(persona)
+        return bool(members) and all(_is_verified(m.user) for m in members)
+    return _is_verified(persona.user)
+
+
 class PersonaSerializer(PersonaSummarySerializer):
     """Full editable persona for its owner. `gallery_images` are its public photos."""
     gallery_images = serializers.SerializerMethodField()
+
+    def validate_discover_filters(self, value):
+        return discover.clean_filters(value)
 
     class Meta(PersonaSummarySerializer.Meta):
         fields = PersonaSummarySerializer.Meta.fields + ['gallery_images'] + Persona.PROFILE_FIELDS
@@ -207,6 +213,9 @@ class DiscoverPersonaSerializer(serializers.ModelSerializer):
     members = serializers.SerializerMethodField()
     member_count = serializers.SerializerMethodField()
     length = serializers.SerializerMethodField()
+    distance = serializers.SerializerMethodField()
+    is_online = serializers.SerializerMethodField()
+    rank = serializers.SerializerMethodField()
 
     class Meta:
         model = Persona
@@ -241,13 +250,24 @@ class DiscoverPersonaSerializer(serializers.ModelSerializer):
             "group_type",
             "members",
             "member_count",
+            "distance",
+            "is_online",
+            "rank",
         ]
 
     def get_is_verified(self, obj):
-        if obj.group_type:
-            members = _accepted_members(obj)
-            return bool(members) and all(_is_verified(m.user) for m in members)
-        return _is_verified(obj.user)
+        return persona_verified(obj)
+
+    # From the discover feed (context `ranked`: {persona id: discover.Ranked}, `ranks`: {id: position}).
+    def get_distance(self, obj):
+        ranked = self.context.get('ranked', {}).get(obj.pk)
+        return ranked.distance if ranked else None
+
+    def get_is_online(self, obj):
+        return discover.is_online(obj, timezone.now())
+
+    def get_rank(self, obj):
+        return self.context.get('ranks', {}).get(obj.pk)
 
     def get_members(self, obj):
         """For a group, each member with only what that member chose to share."""

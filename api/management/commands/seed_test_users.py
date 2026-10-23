@@ -14,6 +14,8 @@ Custom images:
 """
 
 import io
+import random
+from datetime import timedelta
 from pathlib import Path
 from django.core.files.base import ContentFile
 from django.core.management.base import BaseCommand
@@ -269,6 +271,14 @@ def _load_image_file(filename: str) -> ContentFile | None:
 
 TEST_PHONES = {u["phone_number"] for u in TEST_USERS}
 
+# Synthetic users for exercising discover ranking: +1 555 019x xxx (inside the reserved range).
+SYNTHETIC_PREFIX = "+1555019"
+SYNTHETIC_NAMES = ["Alex", "Sam", "Jordan", "Riley", "Casey", "Morgan", "Quinn", "Avery", "Rowan", "Jamie"]
+SYNTHETIC_TYPES = ["Friends", "Chill", "Dates", "Hookups", "FWB", "Companionship", "Long-term",
+                   "Open relationship", "Marriage-minded"]
+SYNTHETIC_KINKS = ["Bondage", "Roleplay", "Leather", "Feet", "Voyeurism", "Exhibitionism"]
+SYNTHETIC_INTERESTS = ["Hiking", "Gaming", "Cooking", "Music", "Travel", "Fitness", "Art", "Movies"]
+
 
 class Command(BaseCommand):
     help = "Seed test users with full profile data, or clear them with --clear."
@@ -280,6 +290,17 @@ class Command(BaseCommand):
             help="Delete all test users and their uploaded images.",
         )
         parser.add_argument(
+            "--synthetic",
+            type=int,
+            metavar="N",
+            help="Create N random users around --near for trying discover ranking (no photos).",
+        )
+        parser.add_argument(
+            "--near",
+            default="39.1,-84.5",
+            help="Center for --synthetic users as LAT,LNG (default 39.1,-84.5).",
+        )
+        parser.add_argument(
             "--tags-only",
             action="store_true",
             help="Re-apply gallery_image_tags from seed data without re-uploading images.",
@@ -288,6 +309,9 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         if options["clear"]:
             self._clear()
+        elif options["synthetic"]:
+            lat, lng = (float(v) for v in options["near"].split(","))
+            self._synthetic(options["synthetic"], lat, lng)
         elif options["tags_only"]:
             self._retag()
         else:
@@ -416,7 +440,42 @@ class Command(BaseCommand):
 
     # ── Clear ─────────────────────────────────────────────────────────────────
 
+    def _synthetic(self, count: int, lat: float, lng: float):
+        rng = random.Random()
+        now = timezone.now()
+        existing = User.objects.filter(phone_number__startswith=SYNTHETIC_PREFIX).count()
+        for i in range(existing, existing + count):
+            user = User.objects.create_user(
+                phone_number=f"{SYNTHETIC_PREFIX}{i:04d}",
+                # Within ~30 km of the center.
+                latitude=lat + rng.uniform(-0.27, 0.27),
+                longitude=lng + rng.uniform(-0.35, 0.35),
+                pronouns=rng.choice(["", "he/him", "she/her", "they/them"]),
+                height=rng.choice([None, rng.randint(155, 200)]),
+            )
+            persona = user.get_active_persona()
+            persona.display_name = f"{rng.choice(SYNTHETIC_NAMES)} {i}"
+            persona.age = rng.randint(18, 60)
+            persona.bio = rng.choice(["", "Just here to see who's around.", "Coffee first."])
+            persona.relationship_types = rng.sample(SYNTHETIC_TYPES, rng.randint(0, 3))
+            persona.intent = 1 if persona.relationship_types else 0
+            persona.is_side = rng.random() < 0.1
+            persona.position = rng.choice([None, 0, 1, 2, 3, 4])
+            persona.power_position = rng.choice([None, 0, 1, 2, 3, 4])
+            persona.kinks = rng.sample(SYNTHETIC_KINKS, rng.randint(0, 3))
+            persona.interests = rng.sample(SYNTHETIC_INTERESTS, rng.randint(0, 4))
+            persona.can_host, persona.can_travel = rng.random() < 0.4, rng.random() < 0.5
+            persona.location_sharing = rng.choice([0, 1, 1, 2])
+            # Idle time skewed toward recent: minutes to weeks.
+            persona.last_active_at = now - timedelta(minutes=rng.expovariate(1 / (60 * 24 * 2)))
+            persona.save()
+        self.stdout.write(self.style.SUCCESS(f"✓ Created {count} synthetic users near {lat},{lng}."))
+
     def _clear(self):
+        synthetic = User.objects.filter(phone_number__startswith=SYNTHETIC_PREFIX)
+        if synthetic.exists():
+            self.stdout.write(f"  Deleting {synthetic.count()} synthetic users")
+            synthetic.delete()
         users = User.objects.filter(phone_number__in=TEST_PHONES)
         count = users.count()
         if count == 0:

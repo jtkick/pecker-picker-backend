@@ -41,14 +41,15 @@ from webauthn.helpers.structs import (
     UserVerificationRequirement,
     AttestationConveyancePreference,
 )
-from .models import User, Persona, PersonaMember, PersonaPhoto, ProfileImage, Album, AlbumGrant, Conversation, ConversationMember, DeviceToken, Message, MessageAttachment, MessageReaction, SavedPhrase, LocationShareGrant, Block, Report, FaceVerification, Kink, Interest, PasskeyCredential, WebAuthnChallenge, OTPVerification
+from .models import User, Persona, PersonaMember, PersonaPhoto, DiscoverEvent, ProfileImage, Album, AlbumGrant, Conversation, ConversationMember, DeviceToken, Message, MessageAttachment, MessageReaction, SavedPhrase, LocationShareGrant, Block, Report, FaceVerification, Kink, Interest, PasskeyCredential, WebAuthnChallenge, OTPVerification
 from .sms import send_otp_sms, send_verify_sms, check_verify_sms
 from .serializers import (
     AccountSerializer, PersonaSummarySerializer, PersonaSerializer,
     GalleryImageSerializer, DiscoverPersonaSerializer, PersonaProfileSerializer,
     AlbumSerializer, AlbumGrantSerializer, LocationShareGrantSerializer, ConversationSerializer, MessageSerializer,
-    GroupMemberSerializer, InvitationSerializer,
+    GroupMemberSerializer, InvitationSerializer, persona_verified,
 )
+from . import discover
 from .membership import (
     ACCEPTED, group_locked, in_use, in_use_q, is_editor, membership, owner_plus_q, persona_user_ids, personas_for,
 )
@@ -1089,16 +1090,92 @@ def _block_exclusions(user):
     return blocked_by_me, blocked_me
 
 
-@api_view(["GET"])
-def profiles_list(request):
-    # Only personas someone is using are discoverable; groups also need a Plus owner.
-    qs = (
+def _discoverable_qs(user):
+    """Personas `user` may find: someone is using it; groups also need a Plus owner."""
+    return (
         _persona_qs()
         .filter(in_use_q(), user__is_active=True)
         .filter(Q(group_type='') | owner_plus_q())
         .exclude(display_name='')
-        .exclude(_hidden_persona_q(request.user))
+        .exclude(_hidden_persona_q(user))
     )
+
+
+class DiscoverThrottle(UserRateThrottle):
+    scope = 'discover'
+
+
+def _feed_response(request, ranked, ids, token, offset):
+    page = ranked[:discover.PAGE_SIZE]
+    end = offset + discover.PAGE_SIZE
+    ctx = {
+        'request': request,
+        'ranked': {r.persona.pk: r for r in page},
+        'ranks': {pk: offset + i for i, pk in enumerate(ids[offset:end])},
+    }
+    return Response({
+        'results': DiscoverPersonaSerializer([r.persona for r in page], many=True, context=ctx).data,
+        'next_cursor': f'{token}:{end}' if end < len(ids) else None,
+    })
+
+
+@api_view(["GET"])
+@throttle_classes([DiscoverThrottle])
+def discover_feed(request):
+    """
+    The ranked feed, a page at a time. Without `cursor` (or with an expired one) it ranks
+    afresh for `sort` / `q` and snapshots the order; with `cursor` it continues that snapshot.
+    """
+    user = request.user
+    me = user.get_active_persona()
+    filters = discover.effective_filters(me, user.has_tier(User.TIER_PLUS))
+    snapshot = discover.load_snapshot(me.pk, request.query_params.get('cursor'))
+    if snapshot is None:
+        sort = request.query_params.get('sort')
+        sort = sort if sort in discover.SORTS else 'recommended'
+        qs = _discoverable_qs(user)
+        query = (request.query_params.get('q') or '').strip()
+        if query:
+            qs = qs.filter(display_name__icontains=query)
+        ranked = discover.rank(qs, user, me, sort=sort, filters=filters, verified=persona_verified)
+        ids = [r.persona.pk for r in ranked]
+        return _feed_response(request, ranked, ids, discover.save_snapshot(me.pk, ids), 0)
+
+    token, ids, offset = snapshot
+    page_ids = ids[offset:offset + discover.PAGE_SIZE]
+    # Load the page fresh, dropping anyone blocked, hidden or gone quiet since the snapshot.
+    fresh = {r.persona.pk: r for r in discover.rank(
+        _discoverable_qs(user).filter(pk__in=page_ids), user, me, filters=filters, verified=persona_verified,
+    )}
+    return _feed_response(request, [fresh[pk] for pk in page_ids if pk in fresh], ids, token, offset)
+
+
+@api_view(["GET"])
+@throttle_classes([DiscoverThrottle])
+def discover_map(request):
+    """Best-ranked pins inside `bbox=min_lat,min_lng,max_lat,max_lng`, at the positions viewers may see."""
+    try:
+        bbox = [float(v) for v in request.query_params['bbox'].split(',')]
+        if len(bbox) != 4 or bbox[0] >= bbox[2] or bbox[1] >= bbox[3]:
+            raise ValueError
+    except (KeyError, ValueError):
+        return Response({'error': 'bbox=min_lat,min_lng,max_lat,max_lng is required.'},
+                        status=status.HTTP_400_BAD_REQUEST)
+    user = request.user
+    me = user.get_active_persona()
+    filters = discover.effective_filters(me, user.has_tier(User.TIER_PLUS))
+    ranked = discover.rank(_discoverable_qs(user), user, me, filters=filters, bbox=bbox, verified=persona_verified)
+    # Off-location personas have no map position to show.
+    pins = [r for r in ranked if r.level >= 1][:discover.MAP_PIN_LIMIT]
+    ctx = {'request': request, 'ranked': {r.persona.pk: r for r in pins}}
+    return Response(DiscoverPersonaSerializer([r.persona for r in pins], many=True, context=ctx).data)
+
+
+@api_view(["GET"])
+def profiles_list(request):
+    """Unranked list for app versions before the discover feed; applies the same visibility windows."""
+    now = timezone.now()
+    qs = _discoverable_qs(request.user).filter(discover.recent_q(now))
 
     # Bounding-box filter: only return users within ~50 km of the viewer.
     # 1 degree of latitude ≈ 111 km; longitude varies but this is a fast approximation.
@@ -1128,8 +1205,23 @@ def profiles_list(request):
         except ValueError:
             pass
 
-    serializer = DiscoverPersonaSerializer(qs, many=True, context={'request': request})
+    personas = [p for p in qs if discover.is_visible(p, now)]
+    serializer = DiscoverPersonaSerializer(personas, many=True, context={'request': request})
     return Response(serializer.data)
+
+
+def _log_discover_event(request, viewer, target, kind):
+    """Record an action on a profile opened from the discover feed (the client passes its `rank`)."""
+    params = {**request.query_params.dict(), **(request.data if isinstance(request.data, dict) else {})}
+    try:
+        rank = int(params.get('rank'))
+    except (TypeError, ValueError):
+        return
+    if rank >= 0:
+        DiscoverEvent.objects.create(
+            viewer_persona=viewer, target_persona=target, kind=kind, rank=rank,
+            sort=str(params.get('sort') or '')[:12],
+        )
 
 
 @api_view(["GET"])
@@ -1144,6 +1236,7 @@ def profile_detail(request, pk):
         persona = None
     if persona is None:
         return Response({'error': 'User not found.'}, status=status.HTTP_404_NOT_FOUND)
+    _log_discover_event(request, me, persona, DiscoverEvent.KIND_OPENED)
     ctx = {'request': request, 'viewer_persona': me}
     return Response(PersonaProfileSerializer(persona, context=ctx).data)
 
@@ -1315,6 +1408,7 @@ def conversations(request):
     if created:
         conv = Conversation.objects.create()
         conv.participants.add(me, other)
+        _log_discover_event(request, me, other, DiscoverEvent.KIND_MESSAGED)
 
     return Response(
         ConversationSerializer(_conversation_qs(me).get(pk=conv.pk), context=ctx).data,

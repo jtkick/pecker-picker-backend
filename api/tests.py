@@ -15,12 +15,16 @@ from PIL import Image
 from rest_framework_simplejwt.tokens import AccessToken
 from rest_framework.test import APITestCase, APITransactionTestCase
 
+from types import SimpleNamespace
+
 from pecker_picker.asgi import application
+from . import discover, geo
 from .media import presigned_url, strip_image_metadata
 from .models import (
-    Album, AlbumGrant, Block, Conversation, ConversationMember, DeviceToken, Message, Persona,
-    PersonaMember, PersonaPhoto, ProfileImage, Report, User,
+    Album, AlbumGrant, Block, Conversation, ConversationMember, DeviceToken, DiscoverEvent, LocationShareGrant,
+    Message, Persona, PersonaMember, PersonaPhoto, ProfileImage, Report, User,
 )
+from .views import DiscoverThrottle
 
 
 def make_user(phone, name, plus=False, lat=39.1, lng=-84.5):
@@ -292,6 +296,175 @@ class GroupPersonaTests(PersonaTestCase):
         self.client.post(f'/api/invitations/{invitation["id"]}/decline/')
         self.assertEqual(self.invite(self.bob_main).status_code, 400)
         self.assertEqual(self.invite(self.carol_main, as_user=self.bob).status_code, 404)   # not a member
+
+
+class DiscoverScoringTests(APITestCase):
+    """The pure ranking functions in api.discover and api.geo."""
+
+    def persona(self, types=(), idle=timedelta(0), **fields):
+        now = timezone.now()
+        return SimpleNamespace(relationship_types=list(types), last_active_at=now - idle, created_at=now, **fields)
+
+    def test_visibility_window_depends_on_what_they_want(self):
+        now = timezone.now()
+        hookup = timedelta(hours=3)
+        self.assertTrue(discover.is_visible(self.persona(['Hookups'], hookup - timedelta(minutes=1)), now))
+        self.assertFalse(discover.is_visible(self.persona(['Hookups'], hookup + timedelta(minutes=1)), now))
+        self.assertTrue(discover.is_visible(self.persona(['Long-term'], timedelta(days=20)), now))
+        # With several, the most patient applies; nothing selected is Browsing.
+        self.assertEqual(discover.freshness_profile(['Hookups', 'Dates']), discover.FRESHNESS['Dates'])
+        self.assertEqual(discover.freshness_profile([]), discover.BROWSING_FRESHNESS)
+
+    def test_freshness_halves_at_half_life_and_is_full_when_online(self):
+        now = timezone.now()
+        self.assertAlmostEqual(discover.freshness(self.persona(['Dates'], timedelta(days=1)), now), 0.5, places=3)
+        self.assertEqual(discover.freshness(self.persona(['Hookups'], timedelta(minutes=2)), now), 1.0)
+
+    def test_intent_compatibility(self):
+        ic = discover.intent_compat
+        self.assertEqual(ic(['Hookups'], ['Hookups']), 1.0)
+        self.assertEqual(ic(['Hookups'], ['FWB']), 0.7)
+        self.assertEqual(ic(['Hookups'], ['Dates']), 0.3)
+        self.assertEqual(ic(['Friends'], ['Long-term']), 0.3)
+        self.assertEqual(ic(['Hookups'], ['Marriage-minded']), 0.0)
+        self.assertEqual(ic([], ['Hookups']), 0.5)
+
+    def test_position_and_power_complement(self):
+        pos = lambda position, is_side=False: SimpleNamespace(position=position, is_side=is_side)
+        self.assertEqual(discover.position_compat(pos(4), pos(0)), 1.0)     # Top + Bottom
+        self.assertEqual(discover.position_compat(pos(4), pos(4)), 0.0)     # Top + Top
+        self.assertEqual(discover.position_compat(pos(2), pos(2)), 1.0)     # Vers + Vers
+        self.assertEqual(discover.position_compat(pos(None, True), pos(None, True)), 1.0)
+        self.assertEqual(discover.position_compat(pos(None, True), pos(4)), discover.SIDE_WITH_OTHER)
+        self.assertIsNone(discover.position_compat(pos(None), pos(4)))
+
+    def test_jitter_is_small_and_stable_within_a_day(self):
+        today = timezone.now().date()
+        self.assertEqual(discover.jitter(1, 2, today), discover.jitter(1, 2, today))
+        self.assertLessEqual(abs(discover.jitter(1, 2, today)), discover.JITTER)
+
+    def test_distance_labels_reveal_only_what_sharing_allows(self):
+        self.assertEqual(geo.distance_label(0.4, 1), '< 1 km')
+        self.assertEqual(geo.distance_label(4.2, 1), '5 km')
+        self.assertEqual(geo.distance_label(80, 1), '50+ km')
+        self.assertIsNone(geo.distance_label(4.2, 0))
+        self.assertEqual(geo.distance_label(0.35, 2), '350 m')
+
+    def test_filters_are_cleaned(self):
+        cleaned = discover.clean_filters({'max_distance_km': 999, 'looking_for': ['Dates', 'nope'],
+                                          'groups': 'all', 'online_now': 'yes', 'junk': 1})
+        self.assertEqual(cleaned, {'max_distance_km': discover.MAX_RADIUS_KM, 'looking_for': ['Dates']})
+
+
+class DiscoverFeedTests(PersonaTestCase):
+    def setUp(self):
+        super().setUp()
+        cache.clear()
+        self.alice_main.relationship_types = ['Long-term']
+        self.alice_main.save()
+
+    def person(self, phone, name, types=(), idle=timedelta(0), **fields):
+        user, persona = make_user(phone, name)
+        persona.relationship_types = list(types)
+        persona.last_active_at = timezone.now() - idle
+        for k, v in fields.items():
+            setattr(persona, k, v)
+        persona.save()
+        return persona
+
+    def feed(self, **params):
+        self.as_user(self.alice)
+        res = self.client.get('/api/discover/', params)
+        self.assertEqual(res.status_code, 200)
+        return res.data
+
+    def test_compatible_people_rank_first(self):
+        self.bob_main.delete()
+        hookup = self.person('+15550100201', 'Hookup', ['Hookups'])
+        longterm = self.person('+15550100202', 'Longterm', ['Long-term'])
+        self.assertEqual([p['id'] for p in self.feed()['results']], [longterm.pk, hookup.pk])
+
+    def test_quiet_profiles_fade_by_intent(self):
+        hookup = self.person('+15550100201', 'Hookup', ['Hookups'], idle=timedelta(hours=4))
+        longterm = self.person('+15550100202', 'Longterm', ['Long-term'], idle=timedelta(days=10))
+        ids = [p['id'] for p in self.feed()['results']]
+        self.assertIn(longterm.pk, ids)
+        self.assertNotIn(hookup.pk, ids)
+        self.assertNotIn(hookup.pk, [p['id'] for p in self.client.get('/api/profiles/').data])   # old apps too
+
+    def test_paging_continues_the_snapshot(self):
+        people = [self.person(f'+155501003{i:02d}', f'P{i}', ['Dates']) for i in range(65)]
+        first = self.feed()
+        self.assertEqual(len(first['results']), discover.PAGE_SIZE)
+        self.assertEqual(first['results'][0]['rank'], 0)
+        # Activity changes mid-scroll must not reshuffle later pages.
+        Persona.objects.filter(pk__in=[p.pk for p in people]).update(last_active_at=timezone.now())
+        second = self.feed(cursor=first['next_cursor'])
+        third = self.feed(cursor=second['next_cursor'])
+        self.assertIsNone(third['next_cursor'])
+        ids = [p['id'] for page in (first, second, third) for p in page['results']]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(len(ids), 66)   # everyone plus Bob
+        self.assertEqual(second['results'][0]['rank'], discover.PAGE_SIZE)
+
+    def test_expired_cursor_starts_over(self):
+        first = self.feed()
+        cache.clear()
+        again = self.feed(cursor='gone:30')
+        self.assertEqual(again['results'][0]['rank'], 0)
+        self.assertEqual([p['id'] for p in again['results']], [p['id'] for p in first['results']])
+
+    def test_plus_filters_need_plus(self):
+        self.alice_main.discover_filters = {'online_now': True, 'looking_for': ['Dates']}
+        self.alice_main.save()
+        dates = self.person('+15550100201', 'Dates', ['Dates'], idle=timedelta(hours=2))
+        self.person('+15550100202', 'Friends', ['Friends'])
+        self.assertEqual([p['id'] for p in self.feed()['results']], [dates.pk])   # free: looking_for only
+        self.alice.subscription_tier = User.TIER_PLUS
+        self.alice.save()
+        self.assertEqual(self.feed()['results'], [])   # Plus: also online now, and Dates was idle 2 h
+
+    def test_filters_saved_through_persona_are_cleaned(self):
+        self.as_user(self.alice)
+        res = self.client.patch(f'/api/personas/{self.alice_main.pk}/',
+                                {'discover_filters': {'age_min': 25, 'bogus': True}}, format='json')
+        self.assertEqual(res.data['discover_filters'], {'age_min': 25})
+
+    def test_distance_is_banded_unless_exact_is_shared(self):
+        self.bob_main.location_sharing = 1
+        self.bob_main.save()
+        self.bob.latitude, self.bob.longitude = 39.1 + 0.03, -84.5   # ~3.3 km north
+        self.bob.save()
+        self.assertIn(self.feed()['results'][0]['distance'], ('3 km', '5 km'))
+        self.bob_main.location_sharing = 0
+        self.bob_main.save()
+        self.assertIsNone(self.feed()['results'][0]['distance'])
+        LocationShareGrant.objects.create(grantor=self.bob_main, grantee=self.alice_main, level=2)
+        self.assertRegex(self.feed()['results'][0]['distance'], r'^\d+\.\d km$')
+
+    def test_map_shows_pins_in_the_box_except_off_location(self):
+        self.bob_main.location_sharing = 1
+        self.bob_main.save()
+        hidden = self.person('+15550100201', 'Off', location_sharing=0)
+        self.as_user(self.alice)
+        pins = self.client.get('/api/discover/map/', {'bbox': '39.0,-84.6,39.2,-84.4'}).data
+        self.assertEqual([p['id'] for p in pins], [self.bob_main.pk])
+        self.assertNotIn(hidden.pk, [p['id'] for p in pins])
+        self.assertEqual(self.client.get('/api/discover/map/', {'bbox': 'nope'}).status_code, 400)
+
+    def test_opening_from_the_feed_is_logged(self):
+        self.as_user(self.alice)
+        self.client.get(f'/api/profiles/{self.bob_main.pk}/', {'rank': 3, 'sort': 'nearby'})
+        event = DiscoverEvent.objects.get()
+        self.assertEqual((event.kind, event.rank, event.sort), ('opened', 3, 'nearby'))
+        self.client.get(f'/api/profiles/{self.bob_main.pk}/')   # not from the feed
+        self.assertEqual(DiscoverEvent.objects.count(), 1)
+
+    def test_throttled(self):
+        with mock.patch.object(DiscoverThrottle, 'THROTTLE_RATES', {'discover': '2/min'}):
+            self.feed()
+            self.feed()
+            self.assertEqual(self.client.get('/api/discover/').status_code, 429)
 
 
 class ConversationTests(PersonaTestCase):
