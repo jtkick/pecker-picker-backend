@@ -27,7 +27,8 @@ from . import discover, geo
 from .media import presigned_url, strip_image_metadata
 from .models import (
     Album, AlbumGrant, Block, Conversation, ConversationMember, DeviceToken, DiscoverEvent, LocationShareGrant,
-    Message, Persona, PersonaMember, PersonaPhoto, ProfileImage, Report, User,
+    Message, OTPVerification, Persona, PersonaMember, PersonaPhoto, ProfileImage, Report, User,
+    WebAuthnChallenge,
 )
 from .views import DiscoverThrottle
 
@@ -978,3 +979,52 @@ class MediaTests(APITestCase):
         clean = strip_image_metadata(SimpleUploadedFile('p.jpg', buf.getvalue()))
         self.assertEqual(dict(Image.open(clean).getexif()), {})
         self.assertIsNone(strip_image_metadata(SimpleUploadedFile('x.jpg', b'not an image')))
+
+
+class HealthCheckTests(APITestCase):
+    def test_ok_when_db_and_cache_answer(self):
+        r = self.client.get('/api/health/')
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.data, {'status': 'ok', 'db': 'ok', 'cache': 'ok'})
+
+    def test_503_when_cache_is_down(self):
+        with mock.patch('api.views.cache') as down:
+            down.set.side_effect = ConnectionError
+            r = self.client.get('/api/health/')
+        self.assertEqual(r.status_code, 503)
+        self.assertEqual(r.data['cache'], 'error')
+
+
+class AuthThrottleTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+
+    def test_otp_send_is_limited_per_phone(self):
+        codes = [
+            self.client.post('/api/auth/otp/request/', {'phone_number': '+15550001111'}).status_code
+            for _ in range(6)
+        ]
+        self.assertEqual(codes, [200] * 5 + [429])
+        # Another number has its own allowance.
+        r = self.client.post('/api/auth/otp/request/', {'phone_number': '+15550002222'})
+        self.assertEqual(r.status_code, 200)
+
+    def test_passkey_begin_is_limited_per_ip(self):
+        codes = [self.client.post('/api/auth/passkey/authenticate/begin/').status_code for _ in range(31)]
+        self.assertNotIn(429, codes[:30])
+        self.assertEqual(codes[30], 429)
+
+
+class PruneTests(APITestCase):
+    def test_deletes_only_long_expired_rows(self):
+        now = timezone.now()
+        WebAuthnChallenge.objects.create(
+            session_id=uuid.uuid4(), challenge='old', action='register', expires_at=now - timedelta(days=2),
+        )
+        fresh = WebAuthnChallenge.objects.create(
+            session_id=uuid.uuid4(), challenge='new', action='register', expires_at=now - timedelta(minutes=1),
+        )
+        OTPVerification.objects.create(phone_number='+15550001111', code='123456', expires_at=now - timedelta(days=2))
+        call_command('prune', stdout=io.StringIO())
+        self.assertEqual(list(WebAuthnChallenge.objects.values_list('pk', flat=True)), [fresh.pk])
+        self.assertFalse(OTPVerification.objects.exists())

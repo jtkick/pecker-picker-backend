@@ -1,17 +1,23 @@
 #!/bin/sh
 set -e
 
-echo "Waiting for MinIO..."
+echo "Waiting for object storage..."
 until python - <<'EOF'
 import boto3, os, sys
+from botocore.exceptions import ClientError
+# head_bucket, not list_buckets: an R2 token scoped to one bucket can't list.
 try:
     boto3.client(
         's3',
         endpoint_url=os.environ['MINIO_ENDPOINT_URL'],
         aws_access_key_id=os.environ['MINIO_ACCESS_KEY'],
         aws_secret_access_key=os.environ['MINIO_SECRET_KEY'],
-    ).list_buckets()
+        region_name=os.environ.get('MINIO_REGION', 'us-east-1'),
+    ).head_bucket(Bucket=os.environ['MINIO_BUCKET'])
     sys.exit(0)
+except ClientError as e:
+    # Reachable but no bucket yet (fresh MinIO): it's created below.
+    sys.exit(0 if e.response['Error']['Code'] in ('404', 'NoSuchBucket') else 1)
 except Exception:
     sys.exit(1)
 EOF

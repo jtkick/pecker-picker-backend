@@ -19,9 +19,10 @@ from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes, throttle_classes
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
-from rest_framework.throttling import UserRateThrottle
+from rest_framework.throttling import AnonRateThrottle, SimpleRateThrottle, UserRateThrottle
 from rest_framework_simplejwt.tokens import RefreshToken
-from django.db import IntegrityError, transaction
+from django.core.cache import cache
+from django.db import IntegrityError, connection, transaction
 from django.db.models import Case, Count, F, OuterRef, Prefetch, Q, Subquery, When
 from django.db.models.functions import Coalesce
 
@@ -64,11 +65,50 @@ from django.conf import settings
 @api_view(["GET"])
 @permission_classes([AllowAny])
 def health_check(request):
-    return Response({"status": "ok"})
+    """Liveness for uptime monitors: 503 unless the database and cache both answer."""
+    checks = {}
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+        checks["db"] = "ok"
+    except Exception:
+        checks["db"] = "error"
+    try:
+        cache.set("health_check", 1, 10)
+        checks["cache"] = "ok" if cache.get("health_check") == 1 else "error"
+    except Exception:
+        checks["cache"] = "error"
+    healthy = all(v == "ok" for v in checks.values())
+    return Response(
+        {"status": "ok" if healthy else "error", **checks},
+        status=status.HTTP_200_OK if healthy else status.HTTP_503_SERVICE_UNAVAILABLE,
+    )
+
+
+class AuthThrottle(AnonRateThrottle):
+    """Per-IP limit on the signed-out auth endpoints."""
+    scope = 'auth'
+
+
+class PhoneThrottle(SimpleRateThrottle):
+    """Per-phone-number limit, so one number can't be flooded with codes or guesses."""
+
+    def get_cache_key(self, request, view):
+        phone = (request.data.get('phone_number') or '').strip()
+        return self.cache_format % {'scope': self.scope, 'ident': phone} if phone else None
+
+
+class OtpSendThrottle(PhoneThrottle):
+    scope = 'otp_send'
+
+
+class OtpVerifyThrottle(PhoneThrottle):
+    scope = 'otp_verify'
 
 
 @api_view(["POST"])
 @permission_classes([AllowAny])
+@throttle_classes([AuthThrottle])
 def passkey_register_begin(request):
     user_handle = uuid.uuid4().bytes
 
@@ -103,6 +143,7 @@ def passkey_register_begin(request):
 
 @api_view(["POST"])
 @permission_classes([AllowAny])
+@throttle_classes([AuthThrottle])
 def passkey_register_complete(request):
     session_id = request.data.get('session_id')
     credential_data = request.data.get('credential')
@@ -157,6 +198,7 @@ def passkey_register_complete(request):
 
 @api_view(["POST"])
 @permission_classes([AllowAny])
+@throttle_classes([AuthThrottle])
 def passkey_authenticate_begin(request):
     options = generate_authentication_options(
         rp_id=settings.WEBAUTHN_RP_ID,
@@ -180,6 +222,7 @@ def passkey_authenticate_begin(request):
 
 @api_view(["POST"])
 @permission_classes([AllowAny])
+@throttle_classes([AuthThrottle])
 def passkey_authenticate_complete(request):
     session_id = request.data.get('session_id')
     credential_data = request.data.get('credential')
@@ -287,6 +330,7 @@ def _verify_otp_code(phone_number: str, code: str):
 
 @api_view(["POST"])
 @permission_classes([AllowAny])
+@throttle_classes([AuthThrottle, OtpSendThrottle])
 def otp_request(request):
     phone = (request.data.get('phone_number') or '').strip()
     if not phone:
@@ -297,6 +341,7 @@ def otp_request(request):
 
 @api_view(["POST"])
 @permission_classes([AllowAny])
+@throttle_classes([AuthThrottle, OtpVerifyThrottle])
 def otp_verify(request):
     phone = (request.data.get('phone_number') or '').strip()
     code = (request.data.get('code') or '').strip()
@@ -323,6 +368,7 @@ def otp_verify(request):
 
 
 @api_view(["POST"])
+@throttle_classes([OtpSendThrottle])
 def link_phone_request(request):
     phone = (request.data.get('phone_number') or '').strip()
     if not phone:
@@ -334,6 +380,7 @@ def link_phone_request(request):
 
 
 @api_view(["POST"])
+@throttle_classes([OtpVerifyThrottle])
 def link_phone_verify(request):
     phone = (request.data.get('phone_number') or '').strip()
     code = (request.data.get('code') or '').strip()

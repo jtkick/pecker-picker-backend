@@ -1,16 +1,33 @@
 from pathlib import Path
 import os
+from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
 
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-SECRET_KEY = os.environ.get("SECRET_KEY", "django-insecure-t57qsp7fkvo(504hpmgq!cq3q$x7l_tvxybvun15-ah2_fl$tj")
-
 DEBUG = os.environ.get("DEBUG", "True") == "True"
 
+# The fallback key is for local dev only; production must set its own.
+SECRET_KEY = os.environ.get("SECRET_KEY") or (
+    "django-insecure-t57qsp7fkvo(504hpmgq!cq3q$x7l_tvxybvun15-ah2_fl$tj" if DEBUG else ""
+)
+if not SECRET_KEY:
+    raise ImproperlyConfigured("SECRET_KEY must be set when DEBUG is False")
+
 ALLOWED_HOSTS = os.environ.get("ALLOWED_HOSTS", "localhost,127.0.0.1,192.168.1.12,triangulum.cc").split(",")
+CSRF_TRUSTED_ORIGINS = [o for o in os.environ.get("CSRF_TRUSTED_ORIGINS", "").split(",") if o]
+
+# ── HTTPS (production sits behind Caddy, which terminates TLS) ───────────────
+if not DEBUG:
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+    SECURE_SSL_REDIRECT = True
+    # Container and uptime health checks hit the backend directly over HTTP.
+    SECURE_REDIRECT_EXEMPT = [r"^api/health/$"]
+    SECURE_HSTS_SECONDS = 30 * 24 * 60 * 60
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
 
 
 INSTALLED_APPS = [
@@ -209,8 +226,14 @@ REST_FRAMEWORK = {
     "DEFAULT_THROTTLE_RATES": {
         "messages": "60/min",
         "discover": "60/min",
+        "auth": "30/min",       # per IP, signed-out passkey/OTP endpoints
+        "otp_send": "5/hour",   # per phone number
+        "otp_verify": "10/hour",
     },
 }
+if not DEBUG:
+    # Caddy is the one proxy in front; without this every client shares Caddy's IP.
+    REST_FRAMEWORK["NUM_PROXIES"] = 1
 
 from datetime import timedelta
 
@@ -232,6 +255,9 @@ LOGGING = {
     'root': {
         'handlers': ['console'],
         'level': 'WARNING',
+    },
+    'loggers': {
+        'api': {'level': 'INFO'},
     },
 }
 

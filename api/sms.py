@@ -4,8 +4,15 @@ from django.conf import settings
 logger = logging.getLogger(__name__)
 
 
+def _masked(phone_number: str) -> str:
+    return f"…{phone_number[-4:]}"
+
+
 def send_otp_sms(phone_number: str, code: str) -> None:
     """Dev-only path: log the OTP instead of sending real SMS."""
+    if not settings.DEBUG:
+        logger.error("SMS is not configured; OTP for %s was not sent", _masked(phone_number))
+        return
     logger.warning("[DEV] OTP for %s: %s", phone_number, code)
 
 
@@ -18,7 +25,7 @@ def send_verify_sms(phone_number: str) -> None:
         to=phone_number,
         channel="sms",
     )
-    logger.info("Verify started for %s — status: %s", phone_number, verification.status)
+    logger.info("Verify started for %s — status: %s", _masked(phone_number), verification.status)
 
 
 def check_verify_sms(phone_number: str, code: str) -> bool:
@@ -30,5 +37,5 @@ def check_verify_sms(phone_number: str, code: str) -> bool:
         to=phone_number,
         code=code,
     )
-    logger.info("Verify check for %s — status: %s", phone_number, result.status)
+    logger.info("Verify check for %s — status: %s", _masked(phone_number), result.status)
     return result.status == "approved"

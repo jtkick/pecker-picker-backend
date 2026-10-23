@@ -3,3 +3,7 @@
 db.sqlite3
 .git
 **/__pycache__
+*.sqlite3
+venv/
+.venv/
+staticfiles/
