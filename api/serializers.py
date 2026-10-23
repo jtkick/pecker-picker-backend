@@ -216,6 +216,7 @@ class DiscoverPersonaSerializer(serializers.ModelSerializer):
     distance = serializers.SerializerMethodField()
     is_online = serializers.SerializerMethodField()
     rank = serializers.SerializerMethodField()
+    is_demo = serializers.BooleanField(source='user.is_demo', read_only=True)
 
     class Meta:
         model = Persona
@@ -253,6 +254,7 @@ class DiscoverPersonaSerializer(serializers.ModelSerializer):
             "distance",
             "is_online",
             "rank",
+            "is_demo",
         ]
 
     def get_is_verified(self, obj):

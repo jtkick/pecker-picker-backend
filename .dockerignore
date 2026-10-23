@@ -1,0 +1,5 @@
+# Secrets come from docker-compose env_file; never bake them into the image.
+.env
+db.sqlite3
+.git
+**/__pycache__

@@ -519,8 +519,11 @@ def _hidden_persona_q(user):
     """
     blocked_by_me, blocked_me = _block_exclusions(user)
     members = PersonaMember.objects.filter(status=ACCEPTED)
+    # Demo accounts are only for testers; real members never see them.
+    demo = Q() if user.is_tester else Q(user__demo_handle__isnull=False)
     return (
-        Q(pk__in=personas_for(user).values('pk'))
+        demo
+        | Q(pk__in=personas_for(user).values('pk'))
         | Q(user__in=blocked_by_me) | Q(user__in=blocked_me)
         | Q(pk__in=members.filter(Q(user__in=blocked_by_me) | Q(user__in=blocked_me)).values('persona_id'))
         | Q(pk__in=Block.objects.filter(blocker=user, blocked__isnull=True).values('blocked_persona_id'))

@@ -34,6 +34,11 @@ class User(AbstractBaseUser, PermissionsMixin):
     notifications_enabled = models.BooleanField(default=True)
     blur_explicit = models.BooleanField(default=False)
 
+    # Handmade demo accounts (see `manage.py demo_users`) have a handle and are
+    # seen only by tester accounts; switching one off sets is_active False.
+    demo_handle = models.CharField(max_length=40, unique=True, null=True, blank=True)
+    is_tester = models.BooleanField(default=False)
+
     # Shared by every persona; each persona decides whether to show them (Persona.show_*).
     pronouns = models.CharField(max_length=20, blank=True)
     height = models.SmallIntegerField(null=True, blank=True)   # cm
@@ -59,6 +64,10 @@ class User(AbstractBaseUser, PermissionsMixin):
     subscription_expires_at = models.DateTimeField(null=True, blank=True)
     stripe_customer_id      = models.CharField(max_length=100, blank=True)
     stripe_subscription_id  = models.CharField(max_length=100, blank=True)
+
+    @property
+    def is_demo(self) -> bool:
+        return self.demo_handle is not None
 
     def has_tier(self, tier: int) -> bool:
         """True if the user's active subscription is at least `tier`."""

@@ -89,8 +89,13 @@ def idle(persona, now) -> timedelta:
     return now - (persona.last_active_at or persona.created_at)
 
 
+def _is_demo(persona) -> bool:
+    return getattr(getattr(persona, 'user', None), 'demo_handle', None) is not None
+
+
 def is_visible(persona, now) -> bool:
-    return idle(persona, now) <= freshness_profile(persona.relationship_types)[1]
+    # Demo profiles stay listed while switched on, however long since they were "active".
+    return _is_demo(persona) or idle(persona, now) <= freshness_profile(persona.relationship_types)[1]
 
 
 def is_online(persona, now) -> bool:
@@ -269,7 +274,10 @@ def with_coords(qs):
 def recent_q(now) -> Q:
     """Cheap database prefilter: active within the longest visibility window."""
     since = now - LONGEST_WINDOW
-    return Q(last_active_at__gte=since) | Q(last_active_at__isnull=True, created_at__gte=since)
+    return (
+        Q(last_active_at__gte=since) | Q(last_active_at__isnull=True, created_at__gte=since)
+        | Q(user__demo_handle__isnull=False)
+    )
 
 
 def _grant_levels(viewer_persona, now) -> dict[int, int]:

@@ -15,7 +15,12 @@ from PIL import Image
 from rest_framework_simplejwt.tokens import AccessToken
 from rest_framework.test import APITestCase, APITransactionTestCase
 
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
+
+from django.core.management import call_command
+from django.core.management.base import CommandError
 
 from pecker_picker.asgi import application
 from . import discover, geo
@@ -465,6 +470,88 @@ class DiscoverFeedTests(PersonaTestCase):
             self.feed()
             self.feed()
             self.assertEqual(self.client.get('/api/discover/').status_code, 429)
+
+
+@override_settings(STORAGES={
+    'default': {'BACKEND': 'django.core.files.storage.InMemoryStorage'},
+    'staticfiles': {'BACKEND': 'django.contrib.staticfiles.storage.StaticFilesStorage'},
+})
+@mock.patch('api.management.commands.demo_users.reverse_geocode', return_value='Downtown')
+class DemoUserTests(PersonaTestCase):
+    RIVER = {
+        'handle': 'river', 'display_name': 'River', 'age': 29, 'looking_for': ['Hookups'],
+        'position': 'vers', 'location': [39.1, -84.5], 'active_minutes_ago': 60 * 24 * 30,
+        'photos': [{'file': '1.png', 'tags': ['face']}],
+    }
+
+    def setUp(self):
+        super().setUp()
+        cache.clear()
+        self.dir = Path(tempfile.mkdtemp())
+        (self.dir / 'photos' / 'river').mkdir(parents=True)
+        Image.new('RGB', (8, 8), 'red').save(self.dir / 'photos' / 'river' / '1.png')
+
+    def sync(self, *entries):
+        (self.dir / 'users.json').write_text(json.dumps(list(entries)))
+        call_command('demo_users', 'sync', dir=str(self.dir), stdout=io.StringIO())
+
+    def feed_ids(self, user):
+        cache.clear()
+        self.as_user(user)
+        return [p['id'] for p in self.client.get('/api/discover/').data['results']]
+
+    def test_sync_creates_then_updates_in_place(self, _):
+        self.sync(self.RIVER)
+        user = User.objects.get(demo_handle='river')
+        persona = user.get_active_persona()
+        self.assertEqual((persona.display_name, persona.position, persona.relationship_types), ('River', 2, ['Hookups']))
+        image = user.gallery_images.get()
+        self.assertTrue(image.tag_face)
+        self.sync({**self.RIVER, 'display_name': 'River B', 'photos': [{'file': '1.png', 'tags': ['torso']}]})
+        image.refresh_from_db()   # same photo kept, only its tags changed
+        self.assertEqual((image.tag_face, image.tag_torso), (False, True))
+        self.assertEqual(User.objects.filter(demo_handle='river').count(), 1)
+        self.assertEqual(user.get_active_persona().photos.count(), 1)
+
+    def test_only_testers_see_them_and_they_never_fade(self, _):
+        self.sync(self.RIVER)
+        river = User.objects.get(demo_handle='river').get_active_persona()
+        self.assertNotIn(river.pk, self.feed_ids(self.alice))
+        self.assertEqual(self.client.get(f'/api/profiles/{river.pk}/').status_code, 404)
+        self.alice.is_tester = True
+        self.alice.save()
+        self.assertIn(river.pk, self.feed_ids(self.alice))   # idle 30 days, looking for hookups
+        cache.clear()
+        result = next(p for p in self.client.get('/api/discover/').data['results'] if p['id'] == river.pk)
+        self.assertTrue(result['is_demo'])
+
+    def test_switching_off_and_on(self, _):
+        self.sync(self.RIVER)
+        self.alice.is_tester = True
+        self.alice.save()
+        river = User.objects.get(demo_handle='river').get_active_persona()
+        call_command('demo_users', 'off', stdout=io.StringIO())
+        self.assertNotIn(river.pk, self.feed_ids(self.alice))
+        call_command('demo_users', 'on', 'river', stdout=io.StringIO())
+        self.assertIn(river.pk, self.feed_ids(self.alice))
+
+    def test_problems_in_the_file_are_reported_and_nothing_changes(self, _):
+        with self.assertRaisesMessage(CommandError, 'unknown field "colour"'):
+            self.sync({**self.RIVER, 'colour': 'red'})
+        with self.assertRaisesMessage(CommandError, 'photo 2.png not found'):
+            self.sync({**self.RIVER, 'photos': [{'file': '2.png'}]})
+        self.assertFalse(User.objects.filter(demo_handle__isnull=False).exists())
+
+    def test_testers_synthetic_and_remove(self, _):
+        call_command('demo_users', 'tester', 'add', str(self.alice.pk), stdout=io.StringIO())
+        self.alice.refresh_from_db()
+        self.assertTrue(self.alice.is_tester)
+        call_command('demo_users', 'synthetic', '3', stdout=io.StringIO())
+        self.assertEqual(User.objects.filter(demo_handle__startswith='synthetic_').count(), 3)
+        call_command('demo_users', 'remove', 'synthetic_0000', stdout=io.StringIO())
+        self.assertEqual(User.objects.filter(demo_handle__startswith='synthetic_').count(), 2)
+        with self.assertRaises(CommandError):
+            call_command('demo_users', 'tester', 'add', '999999', stdout=io.StringIO())
 
 
 class ConversationTests(PersonaTestCase):
