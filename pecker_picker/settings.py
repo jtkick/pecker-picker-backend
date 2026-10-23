@@ -90,9 +90,14 @@ else:
 # Redis is required once more than one server process runs; the in-memory
 # layer only reaches sockets in the same process.
 REDIS_URL = os.environ.get("REDIS_URL", "")
+# redis-py 8 defaults socket_timeout to 5s, the same as channels_redis's
+# blocking BZPOPMIN wait, so idle reads time out before Redis replies.
 CHANNEL_LAYERS = {
     "default": (
-        {"BACKEND": "channels_redis.core.RedisChannelLayer", "CONFIG": {"hosts": [REDIS_URL]}}
+        {
+            "BACKEND": "channels_redis.core.RedisChannelLayer",
+            "CONFIG": {"hosts": [{"address": REDIS_URL, "socket_timeout": 10}]},
+        }
         if REDIS_URL else
         {"BACKEND": "channels.layers.InMemoryChannelLayer"}
     ),
