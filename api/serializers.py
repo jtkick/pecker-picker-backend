@@ -3,7 +3,8 @@ import phonenumbers
 from django.db.models import Q
 from django.utils import timezone
 from rest_framework import serializers
-from .models import User, Persona, ProfileImage, Album, AlbumGrant, Conversation, Message, LocationShareGrant, FaceVerification
+from .models import User, Persona, PersonaMember, ProfileImage, Album, AlbumGrant, Conversation, Message, LocationShareGrant, FaceVerification
+from .membership import in_use
 
 
 def normalize_phone(value: str) -> str:
@@ -68,6 +69,11 @@ def _is_verified(user) -> bool:
 def _location_at_level(persona, level: int, coord: int) -> float | None:
     """coord 0 = latitude, 1 = longitude. Fuzz is seeded per persona so profiles don't share offsets."""
     user = persona.user
+    if persona.group_type:
+        # A group sits where the member who last used it is, and never more precisely
+        # than General: members haven't each agreed to share an exact location.
+        user = persona.last_active_user or user
+        level = min(level, 1)
     if user.latitude is None or user.longitude is None:
         return None
     if level == 2:
@@ -104,6 +110,9 @@ class AccountSerializer(serializers.ModelSerializer):
         fields = [
             "notifications_enabled",
             "blur_explicit",
+            "pronouns",
+            "height",
+            "length",
             "latitude",
             "longitude",
             "subscription_tier",
@@ -127,15 +136,40 @@ class AccountSerializer(serializers.ModelSerializer):
         return obj.library_limit()
 
 
+def _accepted_members(persona) -> list[PersonaMember]:
+    """Works with or without the views' accepted-only `group_members` prefetch."""
+    return [m for m in persona.group_members.all() if m.status == PersonaMember.STATUS_ACCEPTED]
+
+
 class PersonaSummarySerializer(serializers.ModelSerializer):
-    """Compact entry for the persona switcher. Context: `unlocked_ids`, optional `unread_counts`."""
+    """Compact entry for the persona switcher. Context: `request`, `unlocked_ids`, optional `unread_counts`."""
     profile_picture = serializers.SerializerMethodField()
     is_locked = serializers.SerializerMethodField()
     unread_count = serializers.SerializerMethodField()
+    role = serializers.SerializerMethodField()
+    can_edit = serializers.SerializerMethodField()
+    member_count = serializers.SerializerMethodField()
 
     class Meta:
         model = Persona
-        fields = ['id', 'display_name', 'profile_picture', 'color', 'is_primary', 'sort_order', 'is_locked', 'unread_count']
+        fields = [
+            'id', 'display_name', 'profile_picture', 'color_start', 'color_end', 'is_primary', 'sort_order',
+            'is_locked', 'unread_count', 'group_type', 'role', 'can_edit', 'member_count',
+        ]
+        read_only_fields = ['group_type']
+
+    def _is_owner(self, obj):
+        return obj.user_id == self.context['request'].user.pk
+
+    def get_role(self, obj):
+        return PersonaMember.ROLE_OWNER if self._is_owner(obj) else PersonaMember.ROLE_MEMBER
+
+    def get_can_edit(self, obj):
+        user_id = self.context['request'].user.pk
+        return self._is_owner(obj) or any(m.user_id == user_id and m.can_edit for m in _accepted_members(obj))
+
+    def get_member_count(self, obj):
+        return len(_accepted_members(obj)) if obj.group_type else 1
 
     def get_profile_picture(self, obj):
         return _first_photo_url(obj, self.context.get('request'))
@@ -153,7 +187,7 @@ class PersonaSerializer(PersonaSummarySerializer):
 
     class Meta(PersonaSummarySerializer.Meta):
         fields = PersonaSummarySerializer.Meta.fields + ['gallery_images'] + Persona.PROFILE_FIELDS
-        read_only_fields = ['is_primary']
+        read_only_fields = ['is_primary', 'group_type']
 
     def get_gallery_images(self, obj):
         return GalleryImageSerializer(_public_images(obj), many=True, context=self.context).data
@@ -167,7 +201,12 @@ class DiscoverPersonaSerializer(serializers.ModelSerializer):
     longitude = serializers.SerializerMethodField()
     neighborhood = serializers.CharField(source='user.neighborhood', read_only=True)
     is_verified = serializers.SerializerMethodField()
-    kinks = serializers.SerializerMethodField()
+    pronouns = serializers.SerializerMethodField()
+    height = serializers.SerializerMethodField()
+    position = serializers.SerializerMethodField()
+    members = serializers.SerializerMethodField()
+    member_count = serializers.SerializerMethodField()
+    length = serializers.SerializerMethodField()
 
     class Meta:
         model = Persona
@@ -190,6 +229,7 @@ class DiscoverPersonaSerializer(serializers.ModelSerializer):
             "interests",
             "relationship_types",
             "position",
+            "is_side",
             "power_position",
             "can_host",
             "can_travel",
@@ -198,13 +238,54 @@ class DiscoverPersonaSerializer(serializers.ModelSerializer):
             "longitude",
             "neighborhood",
             "is_verified",
+            "group_type",
+            "members",
+            "member_count",
         ]
 
     def get_is_verified(self, obj):
+        if obj.group_type:
+            members = _accepted_members(obj)
+            return bool(members) and all(_is_verified(m.user) for m in members)
         return _is_verified(obj.user)
 
-    def get_kinks(self, obj):
-        return obj.kinks if obj.share_kinks else []
+    def get_members(self, obj):
+        """For a group, each member with only what that member chose to share."""
+        if not obj.group_type:
+            return []
+        request = self.context.get('request')
+        result = []
+        for m in _accepted_members(obj):
+            entry = {'is_verified': _is_verified(m.user)}
+            rep = m.represent_persona
+            if m.share_profile and rep is not None:
+                entry['display_name'] = rep.display_name
+                entry['profile_picture'] = _first_photo_url(rep, request)
+            if m.share_pronouns and m.user.pronouns:
+                entry['pronouns'] = m.user.pronouns
+            if m.share_height and m.user.height is not None:
+                entry['height'] = m.user.height
+            if m.share_length and m.user.length is not None:
+                entry['length'] = m.user.length
+            result.append(entry)
+        return result
+
+    def get_member_count(self, obj):
+        return len(_accepted_members(obj)) if obj.group_type else 1
+
+    def get_position(self, obj):
+        return None if obj.is_side else obj.position
+
+    # Account-wide values, shown only where the persona opts in.
+    # Groups show these per member instead (see get_members).
+    def get_pronouns(self, obj):
+        return obj.user.pronouns if obj.show_pronouns and not obj.group_type else ''
+
+    def get_height(self, obj):
+        return obj.user.height if obj.show_height and not obj.group_type else None
+
+    def get_length(self, obj):
+        return obj.user.length if obj.show_length and not obj.group_type else None
 
     def get_profile_picture(self, obj):
         return _first_photo_url(obj, self.context.get('request'))
@@ -288,19 +369,48 @@ class LocationShareGrantSerializer(serializers.ModelSerializer):
         read_only_fields = ['id', 'created_at']
 
 
+def _shown_as(member: PersonaMember) -> Persona | None:
+    """The persona a group member appears as to the rest of their group."""
+    if member.status == PersonaMember.STATUS_ACCEPTED and member.represent_persona is not None:
+        return member.represent_persona
+    return member.invited_as
+
+
+def _member_name(persona_id: int, user_id: int) -> str:
+    member = (
+        PersonaMember.objects.filter(persona_id=persona_id, user_id=user_id)
+        .select_related('represent_persona', 'invited_as').first()
+    )
+    shown = _shown_as(member) if member is not None else None
+    return shown.display_name if shown is not None else 'A member'
+
+
 class MessageSerializer(serializers.ModelSerializer):
+    """Context: `viewer_persona_id` — only when it's the sending group does `sent_by` say which member wrote it."""
     sender_id = serializers.IntegerField(read_only=True)
     conversation_id = serializers.IntegerField(read_only=True)
     reply_to = serializers.SerializerMethodField()
     reactions = serializers.SerializerMethodField()
     attachments = serializers.SerializerMethodField()
+    sent_by = serializers.SerializerMethodField()
 
     class Meta:
         model = Message
         fields = [
             'id', 'conversation_id', 'sender_id', 'client_id', 'kind', 'body', 'metadata',
-            'reply_to', 'reactions', 'attachments', 'created_at', 'edited_at', 'deleted_at',
+            'reply_to', 'reactions', 'attachments', 'created_at', 'edited_at', 'deleted_at', 'sent_by',
         ]
+
+    def get_sent_by(self, obj):
+        if obj.sender_id != self.context.get('viewer_persona_id') or obj.sender_user_id is None:
+            return None
+        if not obj.sender.group_type:
+            return None
+        if not hasattr(self, '_names'):
+            self._names = {}
+        if obj.sender_user_id not in self._names:
+            self._names[obj.sender_user_id] = _member_name(obj.sender_id, obj.sender_user_id)
+        return self._names[obj.sender_user_id]
 
     def get_attachments(self, obj):
         # View-once photos never get a URL; they're fetched once through attachment_view.
@@ -390,10 +500,10 @@ class ConversationSerializer(serializers.ModelSerializer):
             'profile_picture': _first_photo_url(m.persona, self.context['request']),
             'last_read_message_id': m.last_read_message_id,
             'last_delivered_message_id': m.last_delivered_message_id,
-            # Only a persona the account is currently using shows activity.
+            # Only a persona someone is currently using shows activity.
             'last_active_at': (
                 m.persona.last_active_at.isoformat()
-                if m.persona.last_active_at and m.persona.user.active_persona_id == m.persona_id
+                if m.persona.last_active_at and in_use(m.persona)
                 else None
             ),
         } for m in self._members(obj)]
@@ -410,3 +520,63 @@ class ConversationSerializer(serializers.ModelSerializer):
             'created_at': msg.created_at.isoformat(),
             'deleted': msg.deleted_at is not None,
         }
+
+
+class GroupMemberSerializer(serializers.ModelSerializer):
+    """A group member as the group's own members see them. Share flags are shown only to that member."""
+    is_me = serializers.SerializerMethodField()
+    display_name = serializers.SerializerMethodField()
+    profile_picture = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PersonaMember
+        fields = [
+            'id', 'role', 'status', 'can_edit', 'is_me', 'display_name', 'profile_picture',
+            'represent_persona_id', *PersonaMember.SHARE_FIELDS,
+        ]
+
+    def get_is_me(self, obj):
+        return obj.user_id == self.context['request'].user.pk
+
+    def get_display_name(self, obj):
+        persona = _shown_as(obj)
+        return persona.display_name if persona else 'A member'
+
+    def get_profile_picture(self, obj):
+        persona = _shown_as(obj)
+        return _first_photo_url(persona, self.context['request']) if persona else None
+
+    def to_representation(self, obj):
+        data = super().to_representation(obj)
+        if not data['is_me']:
+            for name in PersonaMember.SHARE_FIELDS + ['represent_persona_id']:
+                data.pop(name)
+        return data
+
+
+class InvitationSerializer(serializers.ModelSerializer):
+    """An invitation to join a group persona, for the invitee."""
+    group = serializers.SerializerMethodField()
+    invited_by = serializers.SerializerMethodField()
+
+    class Meta:
+        model = PersonaMember
+        fields = ['id', 'group', 'invited_by', 'created_at']
+
+    def get_group(self, obj):
+        p = obj.persona
+        return {
+            'id': p.pk,
+            'display_name': p.display_name,
+            'group_type': p.group_type,
+            'profile_picture': _first_photo_url(p, self.context['request']),
+            'member_count': len(_accepted_members(p)),
+            'color_start': p.color_start,
+            'color_end': p.color_end,
+        }
+
+    def get_invited_by(self, obj):
+        via = obj.invited_via
+        if via is None:
+            return None
+        return {'display_name': via.display_name, 'profile_picture': _first_photo_url(via, self.context['request'])}

@@ -1,6 +1,6 @@
 from channels.db import database_sync_to_async
 from channels.generic.websocket import AsyncJsonWebsocketConsumer
-from django.db.models import Subquery
+from django.db.models import F, Subquery
 from django.utils import timezone
 from rest_framework_simplejwt.authentication import JWTAuthentication
 from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
@@ -28,15 +28,19 @@ def _authenticate(scope):
 def _touch_active_persona(user):
     """Record activity on the persona the account is using (drives 'Active now')."""
     # Read the active persona fresh: the user may have switched since connecting.
-    active = User.objects.filter(pk=user.pk).values('active_persona_id')[:1]
-    Persona.objects.filter(pk=Subquery(active)).update(last_active_at=timezone.now())
+    active = Persona.objects.filter(pk=Subquery(User.objects.filter(pk=user.pk).values('active_persona_id')[:1]))
+    active.update(last_active_at=timezone.now())
+    # A group follows whoever last used it, but doesn't flip between members using it at once.
+    active.exclude(last_active_user__active_persona=F('pk')).update(last_active_user=user)
 
 
 @database_sync_to_async
 def _membership(user, conversation_id):
+    """The membership of the persona the user is using now (one account can reach a chat through several)."""
+    active = User.objects.filter(pk=user.pk).values('active_persona_id')[:1]
     try:
         return ConversationMember.objects.get(
-            conversation_id=int(conversation_id), persona__user=user, left_at__isnull=True,
+            conversation_id=int(conversation_id), persona_id=Subquery(active), left_at__isnull=True,
         )
     except (ConversationMember.DoesNotExist, ConversationMember.MultipleObjectsReturned, TypeError, ValueError):
         return None

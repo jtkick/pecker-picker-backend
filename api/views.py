@@ -22,7 +22,7 @@ from rest_framework.response import Response
 from rest_framework.throttling import UserRateThrottle
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.db import IntegrityError, transaction
-from django.db.models import Count, F, OuterRef, Prefetch, Q, Subquery
+from django.db.models import Case, Count, F, OuterRef, Prefetch, Q, Subquery, When
 from django.db.models.functions import Coalesce
 
 from rest_framework_simplejwt.exceptions import TokenError
@@ -41,18 +41,22 @@ from webauthn.helpers.structs import (
     UserVerificationRequirement,
     AttestationConveyancePreference,
 )
-from .models import User, Persona, PersonaPhoto, ProfileImage, Album, AlbumGrant, Conversation, ConversationMember, DeviceToken, Message, MessageAttachment, MessageReaction, SavedPhrase, LocationShareGrant, Block, Report, FaceVerification, Kink, Interest, PasskeyCredential, WebAuthnChallenge, OTPVerification
+from .models import User, Persona, PersonaMember, PersonaPhoto, ProfileImage, Album, AlbumGrant, Conversation, ConversationMember, DeviceToken, Message, MessageAttachment, MessageReaction, SavedPhrase, LocationShareGrant, Block, Report, FaceVerification, Kink, Interest, PasskeyCredential, WebAuthnChallenge, OTPVerification
 from .sms import send_otp_sms, send_verify_sms, check_verify_sms
 from .serializers import (
     AccountSerializer, PersonaSummarySerializer, PersonaSerializer,
     GalleryImageSerializer, DiscoverPersonaSerializer, PersonaProfileSerializer,
     AlbumSerializer, AlbumGrantSerializer, LocationShareGrantSerializer, ConversationSerializer, MessageSerializer,
+    GroupMemberSerializer, InvitationSerializer,
+)
+from .membership import (
+    ACCEPTED, group_locked, in_use, in_use_q, is_editor, membership, owner_plus_q, persona_user_ids, personas_for,
 )
 from .geocoding import reverse_geocode, nearby_label
 from .tagging import auto_tag
 from .media import strip_image_metadata
-from .push import notify_new_message
-from .realtime import broadcast, mark_receipt, send_to_users
+from .push import notify_new_message, notify_persona_invite
+from .realtime import broadcast, mark_receipt, member_user_ids, send_to_users
 from django.conf import settings
 
 
@@ -494,29 +498,64 @@ def _photos_prefetch():
     return Prefetch('photos', queryset=PersonaPhoto.objects.select_related('image'))
 
 
+def _group_members_prefetch():
+    """Accepted group members with what's needed to show their shared info."""
+    return Prefetch('group_members', queryset=PersonaMember.objects.filter(status=ACCEPTED).select_related(
+        'user', 'user__verification', 'represent_persona',
+    ).prefetch_related(Prefetch('represent_persona__photos', queryset=PersonaPhoto.objects.select_related('image'))))
+
+
 def _persona_qs():
-    return Persona.objects.select_related('user', 'user__verification').prefetch_related(_photos_prefetch())
+    return Persona.objects.select_related(
+        'user', 'user__verification', 'last_active_user',
+    ).prefetch_related(_photos_prefetch(), _group_members_prefetch())
+
+
+def _hidden_persona_q(user):
+    """
+    Personas hidden from `user`: ones they can use themselves, ones behind an
+    account block either way (any member of a group counts), and groups they blocked.
+    """
+    blocked_by_me, blocked_me = _block_exclusions(user)
+    members = PersonaMember.objects.filter(status=ACCEPTED)
+    return (
+        Q(pk__in=personas_for(user).values('pk'))
+        | Q(user__in=blocked_by_me) | Q(user__in=blocked_me)
+        | Q(pk__in=members.filter(Q(user__in=blocked_by_me) | Q(user__in=blocked_me)).values('persona_id'))
+        | Q(pk__in=Block.objects.filter(blocker=user, blocked__isnull=True).values('blocked_persona_id'))
+    )
 
 
 def _visible_persona(request, pk):
     """Another account's persona the caller may interact with (active account, no block either way)."""
     try:
-        persona = _persona_qs().filter(user__is_active=True).exclude(user=request.user).get(pk=pk)
+        return _persona_qs().filter(user__is_active=True).exclude(_hidden_persona_q(request.user)).get(pk=pk)
     except (Persona.DoesNotExist, TypeError, ValueError):
         return None
-    if Block.objects.filter(
-        Q(blocker=request.user, blocked=persona.user) | Q(blocker=persona.user, blocked=request.user)
-    ).exists():
-        return None
-    return persona
+
+
+def _my_persona(request, pk, editing=False):
+    """A persona the caller can use (or, with `editing`, edit), else 404/403 response."""
+    persona = get_object_or_404(
+        personas_for(request.user).select_related('user').prefetch_related(_photos_prefetch(), _group_members_prefetch()),
+        pk=pk,
+    )
+    if editing:
+        if not is_editor(request.user, persona):
+            return None, Response({'error': 'Only members allowed to edit can change this profile.'},
+                                  status=status.HTTP_403_FORBIDDEN)
+        if group_locked(persona):
+            return None, Response({'error': 'This group profile is locked until its owner renews Plus.',
+                                   'requires_tier': User.TIER_PLUS}, status=status.HTTP_403_FORBIDDEN)
+    return persona, None
 
 
 def _unread_counts(user) -> dict[int, int]:
-    """Unread incoming messages per persona owned by `user`."""
-    counts = dict.fromkeys(user.personas.values_list('pk', flat=True), 0)
+    """Unread incoming messages per persona `user` can use."""
+    counts = dict.fromkeys(personas_for(user).values_list('pk', flat=True), 0)
     rows = (
         ConversationMember.objects
-        .filter(persona__user=user, left_at__isnull=True)
+        .filter(persona_id__in=list(counts), left_at__isnull=True)
         .annotate(unread=Count(
             'conversation__messages',
             filter=Q(conversation__messages__id__gt=Coalesce(F('last_read_message_id'), 0))
@@ -539,21 +578,30 @@ def _persona_ctx(request):
 
 
 def _persona_list_response(request, status_code=status.HTTP_200_OK):
-    qs = request.user.personas.prefetch_related(_photos_prefetch())
+    # Own personas in the user's order, then groups they've joined.
+    qs = (
+        personas_for(request.user).select_related('user')
+        .prefetch_related(_photos_prefetch(), _group_members_prefetch())
+        .order_by(Case(When(user=request.user, then=0), default=1), 'sort_order', 'created_at')
+    )
     return Response(
         PersonaSummarySerializer(qs, many=True, context=_persona_ctx(request)).data,
         status=status_code,
     )
 
 
-def _image_ids_param(request, max_count=None):
-    """Validate `image_ids` as a list of the caller's library image ids. Returns (ids, error_response)."""
+def _image_ids_param(request, max_count=None, also_allowed=()):
+    """
+    Validate `image_ids` as a list of the caller's library image ids (or ids in
+    `also_allowed`). Returns (ids, error_response).
+    """
     ids = request.data.get('image_ids')
     if not isinstance(ids, list) or not all(isinstance(i, int) for i in ids) or len(set(ids)) != len(ids):
         return None, Response({'error': 'image_ids must be a list of unique integers.'}, status=status.HTTP_400_BAD_REQUEST)
     if max_count is not None and len(ids) > max_count:
         return None, Response({'error': f'At most {max_count} photos allowed.'}, status=status.HTTP_400_BAD_REQUEST)
-    if request.user.gallery_images.filter(pk__in=ids).count() != len(ids):
+    own = [i for i in ids if i not in also_allowed]
+    if request.user.gallery_images.filter(pk__in=own).count() != len(own):
         return None, Response({'error': 'Unknown image.'}, status=status.HTTP_400_BAD_REQUEST)
     return ids, None
 
@@ -574,17 +622,26 @@ def personas(request):
             status=status.HTTP_403_FORBIDDEN,
         )
 
+    group_type = request.data.get('group_type') or ''
+    if group_type not in Persona.GROUP_CAPS and group_type != '':
+        return Response({'error': 'Unknown group_type.'}, status=status.HTTP_400_BAD_REQUEST)
+    if group_type and not user.has_tier(User.TIER_PLUS):
+        return Response(
+            {'error': 'Group profiles require Plus.', 'requires_tier': User.TIER_PLUS},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
     source = None
     if request.data.get('duplicate_from') is not None:
         source = user.personas.filter(pk=request.data.get('duplicate_from')).first()
         if source is None:
             return Response({'error': 'Profile not found.'}, status=status.HTTP_404_NOT_FOUND)
 
-    persona = Persona(user=user, sort_order=user.personas.count())
+    persona = Persona(user=user, sort_order=user.personas.count(), group_type=group_type)
     if source:
         for field in Persona.PROFILE_FIELDS:
             setattr(persona, field, getattr(source, field))
-        persona.color = source.color
+        persona.color_start, persona.color_end = source.color_start, source.color_end
     ctx = _persona_ctx(request)
     serializer = PersonaSerializer(persona, data=request.data, partial=True, context=ctx)
     serializer.is_valid(raise_exception=True)
@@ -595,6 +652,12 @@ def personas(request):
                 PersonaPhoto(persona=persona, image_id=pp.image_id, order=pp.order)
                 for pp in source.photos.all()
             )
+        if group_type:
+            PersonaMember.objects.create(
+                persona=persona, user=user, role=PersonaMember.ROLE_OWNER, status=ACCEPTED,
+                can_edit=True, responded_at=timezone.now(),
+                represent_persona=user.personas.filter(is_primary=True).first(),
+            )
     ctx['unlocked_ids'] = user.unlocked_persona_ids()
     return Response(PersonaSerializer(persona, context=ctx).data, status=status.HTTP_201_CREATED)
 
@@ -602,19 +665,28 @@ def personas(request):
 @api_view(["GET", "PATCH", "DELETE"])
 def persona_detail(request, pk):
     user = request.user
-    persona = get_object_or_404(user.personas.prefetch_related(_photos_prefetch()), pk=pk)
+    persona, err = _my_persona(request, pk, editing=request.method == 'PATCH')
+    if err:
+        return err
     ctx = _persona_ctx(request)
 
     if request.method == "GET":
         return Response(PersonaSerializer(persona, context=ctx).data)
 
     if request.method == "PATCH":
-        serializer = PersonaSerializer(persona, data=request.data, partial=True, context=ctx)
+        data = request.data
+        if persona.user_id != user.pk:
+            # Display order is the owner's.
+            data = {k: v for k, v in request.data.items() if k != 'sort_order'}
+        serializer = PersonaSerializer(persona, data=data, partial=True, context=ctx)
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(serializer.data)
 
     # DELETE
+    if persona.user_id != user.pk:
+        return Response({'error': 'Only the owner can delete a group profile. Leave it instead.'},
+                        status=status.HTTP_403_FORBIDDEN)
     if persona.is_primary:
         return Response({'error': 'The primary profile cannot be deleted.'}, status=status.HTTP_400_BAD_REQUEST)
     with transaction.atomic():
@@ -623,21 +695,25 @@ def persona_detail(request, pk):
             User.objects.filter(pk=user.pk).update(active_persona=primary)
         # Chats belong to the persona; remove them for both sides.
         Conversation.objects.filter(participants=persona).delete()
+        Block.objects.filter(blocked__isnull=True, blocked_persona=persona).delete()
+        member_ids = persona_user_ids([persona.pk]) - {user.pk}
         persona.delete()
+    if member_ids:
+        transaction.on_commit(lambda: send_to_users(member_ids, {'type': 'persona.members', 'persona_id': pk}))
     return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 @api_view(["POST"])
 def persona_activate(request, pk):
     user = request.user
-    persona = get_object_or_404(user.personas, pk=pk)
+    persona = get_object_or_404(personas_for(user), pk=pk)
     if persona.pk not in user.unlocked_persona_ids():
         return Response(
             {'error': 'This profile is locked. Upgrade to use more profiles.',
              'requires_tier': User.TIER_PLUS},
             status=status.HTTP_403_FORBIDDEN,
         )
-    Persona.objects.filter(pk=persona.pk).update(last_active_at=timezone.now())
+    Persona.objects.filter(pk=persona.pk).update(last_active_at=timezone.now(), last_active_user=user)
     User.objects.filter(pk=user.pk).update(active_persona=persona)
     user.active_persona = persona
     return _persona_list_response(request)
@@ -645,8 +721,12 @@ def persona_activate(request, pk):
 
 @api_view(["PUT"])
 def persona_photos(request, pk):
-    persona = get_object_or_404(request.user.personas, pk=pk)
-    ids, err = _image_ids_param(request, settings.MAX_GALLERY_IMAGES)
+    persona, err = _my_persona(request, pk, editing=True)
+    if err:
+        return err
+    # Group editors add from their own library and may keep photos other members added.
+    current = set(persona.photos.values_list('image_id', flat=True))
+    ids, err = _image_ids_param(request, settings.MAX_GALLERY_IMAGES, also_allowed=current)
     if err:
         return err
     with transaction.atomic():
@@ -654,8 +734,187 @@ def persona_photos(request, pk):
         PersonaPhoto.objects.bulk_create(
             PersonaPhoto(persona=persona, image_id=image_id, order=i) for i, image_id in enumerate(ids)
         )
-    persona = request.user.personas.prefetch_related(_photos_prefetch()).get(pk=pk)
+    persona, _ = _my_persona(request, pk)
     return Response(PersonaSerializer(persona, context=_persona_ctx(request)).data)
+
+
+# ── Group personas ────────────────────────────────────────────────────────────
+
+def _notify_group(persona_id, extra_user_ids=()):
+    """Tell every member's devices (and `extra_user_ids`) to reload the group's members."""
+    user_ids = persona_user_ids([persona_id]) | set(extra_user_ids)
+    payload = {'type': 'persona.members', 'persona_id': persona_id}
+    transaction.on_commit(lambda: send_to_users(user_ids, payload))
+
+
+def _leave_group(member):
+    """Remove `member` from their group and undo what their membership put there."""
+    persona, user = member.persona, member.user
+    with transaction.atomic():
+        member.delete()
+        # Photos from the member's own library leave with them.
+        persona.photos.filter(image__user=user).delete()
+        User.objects.filter(pk=user.pk, active_persona=persona).update(active_persona=None)
+        Persona.objects.filter(pk=persona.pk, last_active_user=user).update(last_active_user=None)
+    _notify_group(persona.pk, extra_user_ids=[user.pk])
+
+
+@api_view(["GET", "POST"])
+def persona_members(request, pk):
+    persona, err = _my_persona(request, pk)
+    if err:
+        return err
+    if not persona.group_type:
+        return Response({'error': 'Not a group profile.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if request.method == "GET":
+        members = PersonaMember.objects.filter(persona=persona).all()
+        if persona.user_id != request.user.pk:
+            members = members.exclude(status=PersonaMember.STATUS_DECLINED)
+        members = (
+            members.select_related('user', 'represent_persona', 'invited_as')
+            .prefetch_related(
+                Prefetch('represent_persona__photos', queryset=PersonaPhoto.objects.select_related('image')),
+                Prefetch('invited_as__photos', queryset=PersonaPhoto.objects.select_related('image')),
+            )
+        )
+        return Response(GroupMemberSerializer(members, many=True, context={'request': request}).data)
+
+    # POST — the owner invites the account behind a persona they can see.
+    if persona.user_id != request.user.pk:
+        return Response({'error': 'Only the owner can invite people.'}, status=status.HTTP_403_FORBIDDEN)
+    locked = _locked_group_response(persona)
+    if locked:
+        return locked
+    target = _visible_persona(request, request.data.get('persona_id'))
+    if target is None or target.group_type:
+        return Response({'error': 'User not found.'}, status=status.HTTP_404_NOT_FOUND)
+    invitee = target.user
+    member_ids = persona_user_ids([persona.pk])
+    if Block.objects.filter(
+        Q(blocker=invitee, blocked__in=member_ids) | Q(blocker__in=member_ids, blocked=invitee)
+    ).exists():
+        return Response({'error': 'User not found.'}, status=status.HTTP_404_NOT_FOUND)
+    existing = PersonaMember.objects.filter(persona=persona).filter(user=invitee).first()
+    if existing is not None:
+        message = {
+            PersonaMember.STATUS_INVITED: 'Already invited.',
+            PersonaMember.STATUS_ACCEPTED: 'Already a member.',
+            PersonaMember.STATUS_DECLINED: 'They declined this invitation.',
+        }[existing.status]
+        return Response({'error': message}, status=status.HTTP_400_BAD_REQUEST)
+    cap = Persona.GROUP_CAPS[persona.group_type]
+    if PersonaMember.objects.filter(persona=persona).exclude(status=PersonaMember.STATUS_DECLINED).count() >= cap:
+        return Response({'error': f'A {persona.get_group_type_display().lower()} has at most {cap} people.'},
+                        status=status.HTTP_400_BAD_REQUEST)
+    member = PersonaMember.objects.create(
+        persona=persona, user=invitee, invited_by=request.user,
+        invited_via=request.user.get_active_persona(), invited_as=target,
+    )
+    transaction.on_commit(lambda: send_to_users({invitee.pk}, {'type': 'persona.invite', 'invitation_id': member.pk}))
+    notify_persona_invite(invitee.pk)
+    _notify_group(persona.pk)
+    return Response(GroupMemberSerializer(member, context={'request': request}).data, status=status.HTTP_201_CREATED)
+
+
+@api_view(["PATCH", "DELETE"])
+def persona_member_detail(request, pk, member_id):
+    persona, err = _my_persona(request, pk)
+    if err:
+        return err
+    member = get_object_or_404(PersonaMember.objects.filter(persona=persona).select_related('user', 'persona'), pk=member_id)
+    is_owner = persona.user_id == request.user.pk
+    is_self = member.user_id == request.user.pk
+
+    if request.method == "DELETE":
+        if member.role == PersonaMember.ROLE_OWNER:
+            return Response({'error': 'The owner can delete the group profile instead.'},
+                            status=status.HTTP_400_BAD_REQUEST)
+        if not (is_owner or is_self):
+            return Response({'error': 'Only the owner can remove members.'}, status=status.HTTP_403_FORBIDDEN)
+        _leave_group(member)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    # PATCH — the owner sets edit rights; each member sets what of themself is shared.
+    data = request.data
+    fields = []
+    if 'can_edit' in data:
+        if not is_owner or member.role == PersonaMember.ROLE_OWNER:
+            return Response({'error': 'Only the owner sets who can edit.'}, status=status.HTTP_403_FORBIDDEN)
+        if not isinstance(data['can_edit'], bool):
+            return Response({'error': 'can_edit must be a boolean.'}, status=status.HTTP_400_BAD_REQUEST)
+        member.can_edit = data['can_edit']
+        fields.append('can_edit')
+    personal = [f for f in PersonaMember.SHARE_FIELDS + ['represent_persona_id'] if f in data]
+    if personal and not is_self:
+        return Response({'error': 'Only that member can change what they share.'}, status=status.HTTP_403_FORBIDDEN)
+    err = _apply_personal(member, data)
+    if err:
+        return err
+    member.save(update_fields=fields + [f.removesuffix('_id') for f in personal])
+    _notify_group(persona.pk)
+    return Response(GroupMemberSerializer(member, context={'request': request}).data)
+
+
+def _apply_personal(member, data):
+    """Set the member's own share flags / represent persona from `data`; returns an error response or None."""
+    for name in PersonaMember.SHARE_FIELDS:
+        if name in data:
+            if not isinstance(data[name], bool):
+                return Response({'error': f'{name} must be a boolean.'}, status=status.HTTP_400_BAD_REQUEST)
+            setattr(member, name, data[name])
+    if 'represent_persona_id' in data:
+        rep_id = data['represent_persona_id']
+        rep = None if rep_id is None else member.user.personas.filter(pk=rep_id, group_type='').first()
+        if rep_id is not None and rep is None:
+            return Response({'error': 'Choose one of your own profiles.'}, status=status.HTTP_400_BAD_REQUEST)
+        member.represent_persona = rep
+    return None
+
+
+def _invitations_qs(user):
+    return (
+        PersonaMember.objects.filter(user=user, status=PersonaMember.STATUS_INVITED)
+        .select_related('persona', 'invited_via')
+        .prefetch_related(
+            Prefetch('persona__photos', queryset=PersonaPhoto.objects.select_related('image')),
+            Prefetch('invited_via__photos', queryset=PersonaPhoto.objects.select_related('image')),
+            Prefetch('persona__group_members', queryset=PersonaMember.objects.filter(status=ACCEPTED)),
+        )
+    )
+
+
+@api_view(["GET"])
+def invitations(request):
+    return Response(InvitationSerializer(_invitations_qs(request.user), many=True, context={'request': request}).data)
+
+
+@api_view(["POST"])
+def invitation_respond(request, pk, action):
+    """Accept (with `represent_persona_id` and share flags) or decline. Any tier may join."""
+    if action not in ('accept', 'decline'):
+        return Response(status=status.HTTP_404_NOT_FOUND)
+    member = get_object_or_404(_invitations_qs(request.user).select_related('user'), pk=pk)
+    if action == 'decline':
+        member.status = PersonaMember.STATUS_DECLINED
+        member.responded_at = timezone.now()
+        member.save(update_fields=['status', 'responded_at'])
+        _notify_group(member.persona_id)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    member_ids = persona_user_ids([member.persona_id])
+    if Block.objects.filter(
+        Q(blocker=request.user, blocked__in=member_ids) | Q(blocker__in=member_ids, blocked=request.user)
+    ).exists():
+        return Response({'error': 'This invitation is no longer available.'}, status=status.HTTP_404_NOT_FOUND)
+    err = _apply_personal(member, request.data)
+    if err:
+        return err
+    member.status = ACCEPTED
+    member.responded_at = timezone.now()
+    member.save()
+    _notify_group(member.persona_id)
+    return _persona_list_response(request)
 
 
 # ── Photo library & albums ────────────────────────────────────────────────────
@@ -824,22 +1083,21 @@ def album_grant_delete(request, pk):
 
 def _block_exclusions(user):
     """Returns two querysets of IDs to exclude: users I blocked and users who blocked me."""
-    blocked_by_me = Block.objects.filter(blocker=user).values_list('blocked_id', flat=True)
+    # Group-only blocks have no user; a NULL here would make NOT IN exclude everything.
+    blocked_by_me = Block.objects.filter(blocker=user, blocked__isnull=False).values_list('blocked_id', flat=True)
     blocked_me = Block.objects.filter(blocked=user).values_list('blocker_id', flat=True)
     return blocked_by_me, blocked_me
 
 
 @api_view(["GET"])
 def profiles_list(request):
-    blocked_by_me, blocked_me = _block_exclusions(request.user)
-    # Only each account's active persona is discoverable.
+    # Only personas someone is using are discoverable; groups also need a Plus owner.
     qs = (
         _persona_qs()
-        .filter(user__active_persona=F('pk'), user__is_active=True)
-        .exclude(user=request.user)
+        .filter(in_use_q(), user__is_active=True)
+        .filter(Q(group_type='') | owner_plus_q())
         .exclude(display_name='')
-        .exclude(user__in=blocked_by_me)
-        .exclude(user__in=blocked_me)
+        .exclude(_hidden_persona_q(request.user))
     )
 
     # Bounding-box filter: only return users within ~50 km of the viewer.
@@ -848,11 +1106,13 @@ def profiles_list(request):
         viewer_lat = float(request.query_params['lat'])
         viewer_lng = float(request.query_params['lng'])
         radius_deg = 50.0 / 111.0  # ~0.45°
-        qs = qs.filter(
-            user__latitude__isnull=False,
-            user__longitude__isnull=False,
-            user__latitude__range=(viewer_lat - radius_deg, viewer_lat + radius_deg),
-            user__longitude__range=(viewer_lng - radius_deg, viewer_lng + radius_deg),
+        # A group sits wherever the member who last used it is.
+        qs = qs.annotate(
+            lat=Coalesce('last_active_user__latitude', 'user__latitude'),
+            lng=Coalesce('last_active_user__longitude', 'user__longitude'),
+        ).filter(
+            lat__range=(viewer_lat - radius_deg, viewer_lat + radius_deg),
+            lng__range=(viewer_lng - radius_deg, viewer_lng + radius_deg),
         )
     except (KeyError, ValueError, TypeError):
         pass  # no position provided — return all users (fallback)
@@ -878,7 +1138,7 @@ def profile_detail(request, pk):
     me = request.user.get_active_persona()
     # Non-active personas are only viewable by people already chatting with them,
     # so an account's other profiles can't be enumerated.
-    if persona is not None and persona.user.active_persona_id != persona.pk and not (
+    if persona is not None and not in_use(persona) and not (
         Conversation.objects.filter(participants=persona).filter(participants=me).exists()
     ):
         persona = None
@@ -956,7 +1216,7 @@ def _conversation_qs(me):
         .values('n')
     )
     my_pinned = ConversationMember.objects.filter(conversation=OuterRef('pk'), persona=me).values('pinned')[:1]
-    members = ConversationMember.objects.select_related('persona__user').prefetch_related(
+    members = ConversationMember.objects.select_related('persona__user', 'persona__last_active_user').prefetch_related(
         Prefetch('persona__photos', queryset=PersonaPhoto.objects.select_related('image')),
     )
     return (
@@ -976,7 +1236,7 @@ def _message_qs(me):
     """Messages as `me` sees them: without ones I deleted for myself."""
     return (
         Message.objects.exclude(hidden_for=me)
-        .select_related('reply_to')
+        .select_related('reply_to', 'sender')
         .prefetch_related('reactions', 'attachments')
     )
 
@@ -987,6 +1247,32 @@ def _my_membership(request, pk):
         ConversationMember.objects.select_related('conversation'),
         conversation_id=pk, persona=me, left_at__isnull=True,
     )
+
+
+def _locked_group_response(persona):
+    if group_locked(persona):
+        return Response({'error': 'This group profile is locked until its owner renews Plus.',
+                         'requires_tier': User.TIER_PLUS}, status=status.HTTP_403_FORBIDDEN)
+    return None
+
+
+def _broadcast_message(event_type, msg):
+    """Broadcast a message event. Only a sending group's own members learn which of them sent it."""
+    def payload(context=None):
+        data = MessageSerializer(msg, context=context or {}).data
+        return {'type': event_type, 'conversation_id': msg.conversation_id, 'message': data}
+
+    if not msg.sender.group_type:
+        broadcast(msg.conversation_id, payload())
+        return
+    insiders = persona_user_ids([msg.sender_id])
+    everyone = member_user_ids(msg.conversation_id)
+    inside, outside = payload({'viewer_persona_id': msg.sender_id}), payload()
+
+    def send():
+        send_to_users(everyone & insiders, inside)
+        send_to_users(everyone - insiders, outside)
+    transaction.on_commit(send)
 
 
 def _int_param(request, name, default=None, maximum=None):
@@ -1012,6 +1298,9 @@ def conversations(request):
         return Response(ConversationSerializer(_conversation_qs(me), many=True, context=ctx).data)
 
     # POST — get or create a 1:1 conversation between my active persona and another persona
+    locked = _locked_group_response(me)
+    if locked:
+        return locked
     other = _visible_persona(request, request.data.get('persona_id'))
     if other is None:
         return Response({'error': 'User not found.'}, status=status.HTTP_404_NOT_FOUND)
@@ -1038,6 +1327,7 @@ def conversations(request):
 def conversation_messages(request, pk):
     member = _my_membership(request, pk)
     me, conv = member.persona, member.conversation
+    ctx = {'viewer_persona_id': me.pk}
 
     if request.method == 'GET':
         # Cursor pagination, always returned oldest-first:
@@ -1054,11 +1344,11 @@ def conversation_messages(request, pk):
         query = (request.query_params.get('q') or '').strip()
         if query:
             hits = qs.filter(kind=Message.KIND_TEXT, deleted_at__isnull=True, body__icontains=query)
-            return Response(MessageSerializer(hits.order_by('-id')[:limit], many=True).data)
+            return Response(MessageSerializer(hits.order_by('-id')[:limit], many=True, context=ctx).data)
         if around is not None:
             older = list(qs.filter(id__lte=around).order_by('-id')[:limit // 2 + 1])[::-1]
             newer = list(qs.filter(id__gt=around).order_by('id')[:limit // 2])
-            return Response(MessageSerializer(older + newer, many=True).data)
+            return Response(MessageSerializer(older + newer, many=True, context=ctx).data)
         if after is not None:
             msgs = list(qs.filter(id__gt=after).order_by('id')[:limit])
         else:
@@ -1069,9 +1359,12 @@ def conversation_messages(request, pk):
             mark_receipt(member, 'delivered' if after is not None else 'read', msgs[-1].id)
         if before is None and after is None:
             ConversationMember.objects.filter(pk=member.pk, marked_unread=True).update(marked_unread=False)
-        return Response(MessageSerializer(msgs, many=True).data)
+        return Response(MessageSerializer(msgs, many=True, context=ctx).data)
 
     # POST — send a message
+    locked = _locked_group_response(me)
+    if locked:
+        return locked
     client_id = request.data.get('client_id')
     if client_id is not None:
         try:
@@ -1080,7 +1373,7 @@ def conversation_messages(request, pk):
             return Response({'error': 'Invalid client_id.'}, status=status.HTTP_400_BAD_REQUEST)
         existing = Message.objects.filter(sender=me, client_id=client_id).first()
         if existing is not None:
-            return Response(MessageSerializer(existing).data, status=status.HTTP_200_OK)
+            return Response(MessageSerializer(existing, context=ctx).data, status=status.HTTP_200_OK)
 
     kind = request.data.get('kind') or Message.KIND_TEXT
     if kind not in (Message.KIND_TEXT, Message.KIND_IMAGE):
@@ -1097,11 +1390,11 @@ def conversation_messages(request, pk):
         except (Message.DoesNotExist, TypeError, ValueError):
             return Response({'error': 'Unknown reply_to_id.'}, status=status.HTTP_400_BAD_REQUEST)
 
-    other_users = (
-        conv.members.filter(left_at__isnull=True).exclude(persona=me).values_list('persona__user_id', flat=True)
-    )
+    others = list(conv.members.filter(left_at__isnull=True).exclude(persona=me).values_list('persona_id', flat=True))
+    other_users = persona_user_ids(others)
     if Block.objects.filter(
         Q(blocker=request.user, blocked__in=other_users) | Q(blocker__in=other_users, blocked=request.user)
+        | Q(blocker=request.user, blocked__isnull=True, blocked_persona__in=others)
     ).exists():
         return Response({'error': 'You can no longer message this user.'}, status=status.HTTP_403_FORBIDDEN)
 
@@ -1117,23 +1410,23 @@ def conversation_messages(request, pk):
     try:
         with transaction.atomic():
             msg = Message.objects.create(
-                conversation=conv, sender=me, kind=kind, body=body, client_id=client_id,
-                reply_to=reply_to, metadata=metadata,
+                conversation=conv, sender=me, sender_user=request.user, kind=kind, body=body,
+                client_id=client_id, reply_to=reply_to, metadata=metadata,
             )
             for order, image in enumerate(images):
                 MessageAttachment.objects.create(message=msg, order=order, view_once=view_once, **image)
     except IntegrityError:
         # A concurrent retry with the same client_id won the race.
-        return Response(MessageSerializer(Message.objects.get(sender=me, client_id=client_id)).data)
+        return Response(MessageSerializer(Message.objects.get(sender=me, client_id=client_id), context=ctx).data)
 
     Conversation.objects.filter(pk=conv.pk).update(updated_at=timezone.now())
     # Your own messages are read by you; a new message brings the chat back out of the archive.
     ConversationMember.objects.filter(pk=member.pk).update(last_read_message=msg, last_delivered_message=msg)
     conv.members.exclude(pk=member.pk).filter(archived=True).update(archived=False)
-    data = MessageSerializer(_message_qs(me).get(pk=msg.pk)).data
-    broadcast(conv.pk, {'type': 'message.new', 'conversation_id': conv.pk, 'message': data})
+    msg = _message_qs(me).get(pk=msg.pk)
+    _broadcast_message('message.new', msg)
     notify_new_message(msg)
-    return Response(data, status=status.HTTP_201_CREATED)
+    return Response(MessageSerializer(msg, context=ctx).data, status=status.HTTP_201_CREATED)
 
 
 def _chat_images(request):
@@ -1232,9 +1525,8 @@ def message_detail(request, pk, message_id):
         msg.save(update_fields=['body', 'edited_at'])
 
     msg = _message_qs(member.persona).get(pk=msg.pk)
-    data = MessageSerializer(msg).data
-    broadcast(msg.conversation_id, {'type': 'message.updated', 'conversation_id': msg.conversation_id, 'message': data})
-    return Response(data)
+    _broadcast_message('message.updated', msg)
+    return Response(MessageSerializer(msg, context={'viewer_persona_id': member.persona_id}).data)
 
 
 @api_view(['POST'])
@@ -1257,20 +1549,18 @@ def attachment_view(request, pk, message_id, attachment_id):
         data = f.read()
     attachment.file.delete(save=False)
     MessageAttachment.objects.filter(pk=attachment.pk).update(file='')
-    msg = _message_qs(member.persona).get(pk=msg.pk)
-    broadcast(msg.conversation_id, {
-        'type': 'message.updated', 'conversation_id': msg.conversation_id, 'message': MessageSerializer(msg).data,
-    })
+    _broadcast_message('message.updated', _message_qs(member.persona).get(pk=msg.pk))
     return HttpResponse(data, content_type=attachment.mime)
 
 
 @api_view(['POST'])
 def message_hide(request, pk, message_id):
-    """Delete a message for me only."""
+    """Delete a message for me only (for a group persona, for the whole group)."""
     member, msg = _member_message(request, pk, message_id)
     msg.hidden_for.add(member.persona)
     payload = {'type': 'message.hidden', 'conversation_id': msg.conversation_id, 'message_id': msg.pk}
-    transaction.on_commit(lambda: send_to_users({request.user.pk}, payload))
+    user_ids = persona_user_ids([member.persona_id])
+    transaction.on_commit(lambda: send_to_users(user_ids, payload))
     return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -1363,7 +1653,7 @@ def _target_persona(request):
         return (
             Persona.objects.select_related('user')
             .filter(user__is_active=True)
-            .exclude(user=request.user)
+            .exclude(pk__in=personas_for(request.user).values('pk'))
             .get(pk=request.data.get('persona_id'))
         )
     except (Persona.DoesNotExist, TypeError, ValueError):
@@ -1385,17 +1675,23 @@ def blocks(request):
     target = _target_persona(request)
     if target is None:
         return Response({'error': 'User not found.'}, status=status.HTTP_404_NOT_FOUND)
-    # Blocks are account-wide: every persona on both sides is hidden.
-    Block.objects.update_or_create(
-        blocker=request.user, blocked=target.user, defaults={'blocked_persona': target},
-    )
+    if target.group_type:
+        # Hides just this group; its members' own profiles stay visible.
+        Block.objects.get_or_create(blocker=request.user, blocked=None, blocked_persona=target)
+    else:
+        # Blocks are account-wide: every persona on both sides is hidden.
+        Block.objects.update_or_create(
+            blocker=request.user, blocked=target.user, defaults={'blocked_persona': target},
+        )
     return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 @api_view(["DELETE"])
 def block_delete(request, pk):
     """`pk` is the blocked persona's id."""
-    Block.objects.filter(blocker=request.user, blocked__personas__pk=pk).delete()
+    Block.objects.filter(
+        Q(blocked__personas__pk=pk) | Q(blocked__isnull=True, blocked_persona_id=pk), blocker=request.user,
+    ).delete()
     return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -1459,9 +1755,10 @@ def reports(request):
     if request.data.get('message_id') is not None:
         # Evidence must be a message the reported persona sent to one of my personas.
         try:
-            message = Message.objects.select_related('conversation').get(
-                pk=request.data.get('message_id'), sender=target,
-                conversation__members__persona__user=request.user,
+            message = (
+                Message.objects.select_related('conversation')
+                .filter(conversation__members__persona__in=personas_for(request.user)).distinct()
+                .get(pk=request.data.get('message_id'), sender=target)
             )
         except (Message.DoesNotExist, TypeError, ValueError):
             return Response({'error': 'Message not found.'}, status=status.HTTP_404_NOT_FOUND)

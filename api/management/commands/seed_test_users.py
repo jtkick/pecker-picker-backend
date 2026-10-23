@@ -311,6 +311,9 @@ class Command(BaseCommand):
 
             for field in ("notifications_enabled", "latitude", "longitude"):
                 setattr(user, field, data[field])
+            for field in ("pronouns", "height", "length"):
+                if field in data:
+                    setattr(user, field, data[field])
             user.save()
 
             persona = user.get_active_persona()

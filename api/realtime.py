@@ -7,6 +7,7 @@ from channels.layers import get_channel_layer
 from django.db import transaction
 from django.db.models import Q
 
+from .membership import persona_user_ids
 from .models import ConversationMember, Message
 
 
@@ -15,10 +16,11 @@ def user_group(user_id: int) -> str:
 
 
 def member_user_ids(conversation_id: int) -> set[int]:
-    return set(
+    """Every account behind the conversation's members, including all of a group persona's."""
+    return persona_user_ids(
         ConversationMember.objects
         .filter(conversation_id=conversation_id, left_at__isnull=True)
-        .values_list('persona__user_id', flat=True)
+        .values_list('persona_id', flat=True)
     )
 
 

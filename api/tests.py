@@ -19,7 +19,7 @@ from pecker_picker.asgi import application
 from .media import presigned_url, strip_image_metadata
 from .models import (
     Album, AlbumGrant, Block, Conversation, ConversationMember, DeviceToken, Message, Persona,
-    PersonaPhoto, ProfileImage, Report, User,
+    PersonaMember, PersonaPhoto, ProfileImage, Report, User,
 )
 
 
@@ -133,6 +133,165 @@ class DiscoverTests(PersonaTestCase):
         self.assertEqual([p['id'] for p in self.client.get('/api/blocks/').data], [alt.pk])
         self.client.delete(f'/api/blocks/{alt.pk}/')
         self.assertFalse(Block.objects.exists())
+
+
+class GroupPersonaTests(PersonaTestCase):
+    def setUp(self):
+        super().setUp()
+        cache.clear()
+        self.alice.subscription_tier = User.TIER_PLUS
+        self.alice.save()
+        self.bob.pronouns, self.bob.height = 'he/him', 180
+        self.bob.latitude = 39.3
+        self.bob.save()
+        self.carol, self.carol_main = make_user('+15550100103', 'Carol')
+        self.as_user(self.alice)
+        res = self.client.post('/api/personas/', {'display_name': 'A+B', 'group_type': 'couple'})
+        self.assertEqual(res.status_code, 201)
+        self.group = Persona.objects.get(pk=res.data['id'])
+
+    def invite(self, persona, as_user=None):
+        self.as_user(as_user or self.alice)
+        return self.client.post(f'/api/personas/{self.group.pk}/members/', {'persona_id': persona.pk})
+
+    def join_bob(self, **share):
+        self.assertEqual(self.invite(self.bob_main).status_code, 201)
+        self.as_user(self.bob)
+        invitation = self.client.get('/api/invitations/').data[0]
+        res = self.client.post(f'/api/invitations/{invitation["id"]}/accept/',
+                               {'represent_persona_id': self.bob_main.pk, **share}, format='json')
+        self.assertEqual(res.status_code, 200)
+        return PersonaMember.objects.get(persona=self.group, user=self.bob)
+
+    def listing(self, user):
+        self.as_user(user)
+        return {p['id']: p for p in self.client.get('/api/personas/').data}
+
+    def test_only_plus_creates_groups(self):
+        self.as_user(self.bob)
+        res = self.client.post('/api/personas/', {'display_name': 'G', 'group_type': 'group'})
+        self.assertEqual(res.status_code, 403)
+        self.assertEqual(res.data['requires_tier'], User.TIER_PLUS)
+        owner = PersonaMember.objects.get(persona=self.group)
+        self.assertEqual((owner.user, owner.role, owner.status), (self.alice, 'owner', 'accepted'))
+
+    def test_free_invitee_joins_without_using_their_limit(self):
+        self.join_bob()
+        entry = self.listing(self.bob)[self.group.pk]
+        self.assertEqual((entry['is_locked'], entry['role'], entry['can_edit'], entry['member_count']),
+                         (False, 'member', False, 2))
+        self.assertEqual(self.client.post('/api/personas/', {'display_name': 'Bob alt'}).status_code, 201)
+        self.assertEqual(self.client.post(f'/api/personas/{self.group.pk}/activate/').status_code, 200)
+
+    def test_edit_rights_and_share_flags(self):
+        member = self.join_bob()
+        url = f'/api/personas/{self.group.pk}/members/{member.pk}/'
+        self.as_user(self.bob)
+        self.assertEqual(self.client.patch(f'/api/personas/{self.group.pk}/', {'bio': 'x'}).status_code, 403)
+        self.assertEqual(self.client.patch(url, {'can_edit': True}, format='json').status_code, 403)
+        self.as_user(self.alice)
+        self.assertEqual(self.client.patch(url, {'share_height': True}, format='json').status_code, 403)
+        self.assertEqual(self.client.patch(url, {'can_edit': True}, format='json').status_code, 200)
+        self.as_user(self.bob)
+        self.assertEqual(self.client.patch(f'/api/personas/{self.group.pk}/', {'bio': 'x'}).status_code, 200)
+        self.assertEqual(self.client.patch(url, {'share_height': True}, format='json').status_code, 200)
+        self.assertEqual(self.client.delete(f'/api/personas/{self.group.pk}/').status_code, 403)
+
+    def test_discover_shows_only_shared_member_info_at_active_members_location(self):
+        self.join_bob(share_profile=True, share_pronouns=True)
+        self.group.location_sharing = 2   # capped to General for groups
+        self.group.save()
+        self.as_user(self.bob)
+        self.client.post(f'/api/personas/{self.group.pk}/activate/')
+        self.as_user(self.carol)
+        profiles = {p['id']: p for p in self.client.get('/api/profiles/').data}
+        self.assertIn(self.alice_main.pk, profiles)   # Alice still uses her own profile
+        group = profiles[self.group.pk]
+        self.assertEqual(group['member_count'], 2)
+        self.assertIn({'is_verified': False}, group['members'])   # Alice shares nothing by default
+        bob = next(m for m in group['members'] if 'display_name' in m)
+        self.assertEqual(bob['display_name'], 'Bob')
+        self.assertEqual(bob['pronouns'], 'he/him')
+        self.assertNotIn('height', bob)
+        self.assertNotEqual(group['latitude'], 39.3)
+        self.assertAlmostEqual(group['latitude'], 39.3, delta=0.005)
+
+    def test_messages_reach_all_members_and_only_they_see_who_sent(self):
+        self.join_bob()
+        conv = Conversation.objects.create()
+        conv.participants.add(self.group, self.carol_main)
+        for user in (self.alice, self.bob):
+            self.as_user(user)
+            self.client.post(f'/api/personas/{self.group.pk}/activate/')
+        url = f'/api/conversations/{conv.pk}/messages/'
+        with self.captureOnCommitCallbacks(execute=False) as callbacks:
+            self.as_user(self.bob)
+            self.assertEqual(self.client.post(url, {'body': 'hi'}).data['sent_by'], 'Bob')
+        with mock.patch('api.views.send_to_users') as send:
+            for cb in callbacks:
+                cb()
+        sent = {frozenset(c.args[0]): c.args[1]['message']['sent_by'] for c in send.call_args_list
+                if c.args[1]['type'] == 'message.new'}
+        self.assertEqual(sent, {frozenset({self.alice.pk, self.bob.pk}): 'Bob', frozenset({self.carol.pk}): None})
+        self.as_user(self.alice)
+        self.assertEqual(self.client.get(url).data[-1]['sent_by'], 'Bob')
+        self.as_user(self.carol)
+        self.assertIsNone(self.client.get(url).data[-1]['sent_by'])
+
+    def test_owner_downgrade_locks_group_for_everyone(self):
+        self.join_bob()
+        self.as_user(self.bob)
+        self.client.post(f'/api/personas/{self.group.pk}/activate/')
+        self.alice.subscription_expires_at = timezone.now() - timedelta(days=1)
+        self.alice.save()
+        self.assertTrue(self.listing(self.bob)[self.group.pk]['is_locked'])
+        self.assertEqual(self.client.patch(f'/api/personas/{self.group.pk}/', {'bio': 'x'}).status_code, 403)
+        self.assertEqual(self.client.post(f'/api/personas/{self.bob_main.pk}/activate/').status_code, 200)
+        self.assertEqual(self.client.post(f'/api/personas/{self.group.pk}/activate/').status_code, 403)
+        self.as_user(self.carol)
+        self.assertNotIn(self.group.pk, [p['id'] for p in self.client.get('/api/profiles/').data])
+
+    def test_blocks_hide_the_group(self):
+        self.join_bob()
+        self.as_user(self.alice)
+        self.client.post(f'/api/personas/{self.group.pk}/activate/')
+        self.as_user(self.carol)
+        self.assertEqual(self.client.post('/api/blocks/', {'persona_id': self.group.pk}).status_code, 204)
+        ids = [p['id'] for p in self.client.get('/api/profiles/').data]
+        self.assertNotIn(self.group.pk, ids)
+        self.assertIn(self.bob_main.pk, ids)   # members' own profiles stay visible
+        self.assertTrue(Block.objects.filter(blocker=self.carol, blocked=None, blocked_persona=self.group).exists())
+        self.client.delete(f'/api/blocks/{self.group.pk}/')
+        self.assertIn(self.group.pk, [p['id'] for p in self.client.get('/api/profiles/').data])
+        Block.objects.create(blocker=self.bob, blocked=self.carol)   # an account block with any member
+        self.assertNotIn(self.group.pk, [p['id'] for p in self.client.get('/api/profiles/').data])
+
+    def test_leaving_resets_active_persona_and_removes_own_photos(self):
+        member = self.join_bob()
+        member.can_edit = True
+        member.save()
+        img = ProfileImage.objects.create(user=self.bob, image='gallery/b.jpg')
+        self.as_user(self.bob)
+        self.client.post(f'/api/personas/{self.group.pk}/activate/')
+        self.assertEqual(self.client.put(f'/api/personas/{self.group.pk}/photos/', {'image_ids': [img.pk]},
+                                         format='json').status_code, 200)
+        self.assertEqual(self.client.delete(f'/api/personas/{self.group.pk}/members/{member.pk}/').status_code, 204)
+        self.bob.refresh_from_db()   # force_authenticate reuses this object
+        self.assertEqual(self.client.get('/api/me/').data['active_persona_id'], self.bob_main.pk)
+        self.assertNotIn(self.group.pk, self.listing(self.bob))
+        self.assertFalse(self.group.photos.exists())
+        self.assertEqual(self.listing(self.alice)[self.group.pk]['member_count'], 1)
+
+    def test_cap_and_no_reinvite_after_decline(self):
+        self.assertEqual(self.invite(self.bob_main).status_code, 201)
+        self.assertEqual(self.invite(self.carol_main).status_code, 400)   # a couple is two people
+        self.as_user(self.bob)
+        invitation = self.client.get('/api/invitations/').data[0]
+        self.assertEqual(invitation['group']['display_name'], 'A+B')
+        self.assertEqual(invitation['invited_by']['display_name'], 'Alice')
+        self.client.post(f'/api/invitations/{invitation["id"]}/decline/')
+        self.assertEqual(self.invite(self.bob_main).status_code, 400)
+        self.assertEqual(self.invite(self.carol_main, as_user=self.bob).status_code, 404)   # not a member
 
 
 class ConversationTests(PersonaTestCase):

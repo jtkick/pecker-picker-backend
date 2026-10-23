@@ -2,6 +2,7 @@ from datetime import timedelta
 
 from django.conf import settings
 from django.contrib.auth.models import AbstractBaseUser, BaseUserManager, PermissionsMixin
+from django.core.validators import MaxValueValidator
 from django.db import models
 from django.utils import timezone
 
@@ -32,6 +33,11 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     notifications_enabled = models.BooleanField(default=True)
     blur_explicit = models.BooleanField(default=False)
+
+    # Shared by every persona; each persona decides whether to show them (Persona.show_*).
+    pronouns = models.CharField(max_length=20, blank=True)
+    height = models.SmallIntegerField(null=True, blank=True)   # cm
+    length = models.SmallIntegerField(null=True, blank=True)   # tenths of an inch, 0–120
 
     # The persona currently visible in discover and used for messaging.
     active_persona = models.ForeignKey(
@@ -75,18 +81,27 @@ class User(AbstractBaseUser, PermissionsMixin):
         """
         Personas usable under the current tier. Over the limit (e.g. after a
         downgrade) the primary plus the most recently used ones stay unlocked.
+        Group personas need their owner to be Plus; ones the user only belongs
+        to don't count toward the user's own limit.
         """
-        personas = list(self.personas.all())
+        is_plus = self.has_tier(self.TIER_PLUS)
+        personas = [p for p in self.personas.all() if is_plus or not p.group_type]
+        joined = {
+            p.pk for p in Persona.objects.filter(
+                group_members__user=self, group_members__status=PersonaMember.STATUS_ACCEPTED,
+            ).exclude(user=self).select_related('user')
+            if p.user.has_tier(self.TIER_PLUS)
+        }
         limit = self.persona_limit()
         if len(personas) <= limit:
-            return {p.pk for p in personas}
+            return {p.pk for p in personas} | joined
         primary = [p for p in personas if p.is_primary]
         others = sorted(
             (p for p in personas if not p.is_primary),
             key=lambda p: (p.pk == self.active_persona_id, p.last_active_at or p.created_at),
             reverse=True,
         )
-        return {p.pk for p in (primary + others)[:limit]}
+        return {p.pk for p in (primary + others)[:limit]} | joined
 
     def get_active_persona(self) -> 'Persona':
         """Return the active persona, creating/assigning the primary one if needed."""
@@ -109,17 +124,29 @@ class User(AbstractBaseUser, PermissionsMixin):
 
 
 class Persona(models.Model):
-    """One of a user's profiles. Only the user's active persona appears in discover."""
+    """
+    One of a user's profiles. Only a persona someone is using (their active one)
+    appears in discover. A group persona (`group_type` set) is shared by its
+    owner (`user`) and the accounts in `group_members`.
+    """
+    GROUP_COUPLE, GROUP_THROUPLE, GROUP_GROUP = 'couple', 'throuple', 'group'
+    GROUP_TYPE_CHOICES = [('', 'Solo'), (GROUP_COUPLE, 'Couple'), (GROUP_THROUPLE, 'Throuple'), (GROUP_GROUP, 'Group')]
+    GROUP_CAPS = {GROUP_COUPLE: 2, GROUP_THROUPLE: 3, GROUP_GROUP: 10}
+
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='personas')
+    group_type = models.CharField(max_length=10, choices=GROUP_TYPE_CHOICES, blank=True, default='')
+    # Member who last used the persona; places a group persona on the map and shows its activity.
+    last_active_user = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name='+')
     is_primary = models.BooleanField(default=False)
     sort_order = models.SmallIntegerField(default=0)
-    color = models.SmallIntegerField(default=0)   # index into the client's persona palette
+    # Accent gradient the client tints its UI with while this persona is active (0xRRGGBB).
+    color_start = models.PositiveIntegerField(default=0xE53935, validators=[MaxValueValidator(0xFFFFFF)])
+    color_end = models.PositiveIntegerField(default=0xF9A825, validators=[MaxValueValidator(0xFFFFFF)])
     created_at = models.DateTimeField(auto_now_add=True)
     last_active_at = models.DateTimeField(null=True, blank=True)
 
     display_name = models.CharField(max_length=50, blank=True)
     bio = models.TextField(max_length=300, blank=True)
-    pronouns = models.CharField(max_length=20, blank=True)
     age = models.SmallIntegerField(null=True, blank=True)
 
     # 0 = Browsing, 1 = Looking
@@ -136,12 +163,14 @@ class Persona(models.Model):
     POWER_POSITION_CHOICES = [(0,'Sub'),(1,'Sub Switch'),(2,'Switch'),(3,'Dom Switch'),(4,'Dom')]
 
     position       = models.SmallIntegerField(null=True, blank=True, choices=POSITION_CHOICES)
+    is_side        = models.BooleanField(default=False)   # hides position; position is kept for switching back
     power_position = models.SmallIntegerField(null=True, blank=True, choices=POWER_POSITION_CHOICES)
 
-    height = models.SmallIntegerField(null=True, blank=True)   # cm
-    length = models.SmallIntegerField(null=True, blank=True)   # tenths of an inch, 0–120
+    # Whether this persona shows the account's pronouns / height / length.
+    show_pronouns = models.BooleanField(default=True)
+    show_height = models.BooleanField(default=True)
+    show_length = models.BooleanField(default=True)
     kinks  = models.JSONField(default=list, blank=True)        # list of strings
-    share_kinks = models.BooleanField(default=False)
     interests = models.JSONField(default=list, blank=True)          # list of strings
     relationship_types = models.JSONField(default=list, blank=True)  # list of strings
 
@@ -150,10 +179,10 @@ class Persona(models.Model):
 
     # Fields copied by "duplicate"; everything a user edits on a profile.
     PROFILE_FIELDS = [
-        'display_name', 'bio', 'pronouns', 'age', 'intent',
+        'display_name', 'bio', 'age', 'intent',
         'looking_for_chat', 'looking_for_cuddle', 'looking_for_fool_around', 'looking_for_sex',
-        'location_sharing', 'position', 'power_position', 'height', 'length',
-        'kinks', 'share_kinks', 'interests', 'relationship_types', 'can_host', 'can_travel',
+        'location_sharing', 'position', 'is_side', 'power_position', 'show_pronouns', 'show_height', 'show_length',
+        'kinks', 'interests', 'relationship_types', 'can_host', 'can_travel',
     ]
 
     class Meta:
@@ -161,6 +190,42 @@ class Persona(models.Model):
 
     def __str__(self):
         return self.display_name or f'Persona {self.pk}'
+
+
+class PersonaMember(models.Model):
+    """
+    An account in a group persona. The owner has a row too. Only the owner sets
+    `can_edit`; only the member themself sets what of their own info is shared.
+    """
+    ROLE_OWNER, ROLE_MEMBER = 'owner', 'member'
+    STATUS_INVITED, STATUS_ACCEPTED, STATUS_DECLINED = 'invited', 'accepted', 'declined'
+    STATUS_CHOICES = [(STATUS_INVITED, 'Invited'), (STATUS_ACCEPTED, 'Accepted'), (STATUS_DECLINED, 'Declined')]
+
+    persona = models.ForeignKey(Persona, on_delete=models.CASCADE, related_name='group_members')
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='group_memberships')
+    role = models.CharField(max_length=10, choices=[(ROLE_OWNER, 'Owner'), (ROLE_MEMBER, 'Member')], default=ROLE_MEMBER)
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default=STATUS_INVITED)
+    invited_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name='+')
+    # The inviter's persona at the time — what the invitee knows them as.
+    invited_via = models.ForeignKey(Persona, null=True, blank=True, on_delete=models.SET_NULL, related_name='+')
+    # The invitee's persona the owner invited — how the group knows them until they pick `represent_persona`.
+    invited_as = models.ForeignKey(Persona, null=True, blank=True, on_delete=models.SET_NULL, related_name='+')
+    created_at = models.DateTimeField(auto_now_add=True)
+    responded_at = models.DateTimeField(null=True, blank=True)
+
+    can_edit = models.BooleanField(default=False)
+    # One of the member's own solo personas that stands for them (name + first photo).
+    represent_persona = models.ForeignKey(Persona, null=True, blank=True, on_delete=models.SET_NULL, related_name='+')
+    share_profile = models.BooleanField(default=False)
+    share_pronouns = models.BooleanField(default=False)
+    share_height = models.BooleanField(default=False)
+    share_length = models.BooleanField(default=False)
+
+    SHARE_FIELDS = ['share_profile', 'share_pronouns', 'share_height', 'share_length']
+
+    class Meta:
+        unique_together = [('persona', 'user')]
+        ordering = ['created_at']
 
 
 class ProfileImage(models.Model):
@@ -301,6 +366,8 @@ class Message(models.Model):
     # Client-generated id so a retried send never creates a duplicate.
     client_id = models.UUIDField(null=True, blank=True)
     reply_to = models.ForeignKey('self', null=True, blank=True, on_delete=models.SET_NULL, related_name='+')
+    # The account that sent it; differs between messages from a group persona.
+    sender_user = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name='+')
     created_at = models.DateTimeField(auto_now_add=True)
     edited_at = models.DateTimeField(null=True, blank=True)
     deleted_at = models.DateTimeField(null=True, blank=True)
@@ -369,13 +436,20 @@ class DeviceToken(models.Model):
 
 class Block(models.Model):
     blocker = models.ForeignKey(User, on_delete=models.CASCADE, related_name='blocks_given')
-    blocked = models.ForeignKey(User, on_delete=models.CASCADE, related_name='blocks_received')
-    # The persona the block was made from, shown in the blocked list. Blocks apply account-wide.
+    # Null for a block of a group persona only, which hides that group but not its members' own profiles.
+    blocked = models.ForeignKey(User, null=True, blank=True, on_delete=models.CASCADE, related_name='blocks_received')
+    # The persona the block was made from, shown in the blocked list. Account blocks apply account-wide.
     blocked_persona = models.ForeignKey(Persona, null=True, blank=True, on_delete=models.SET_NULL, related_name='+')
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         unique_together = [('blocker', 'blocked')]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['blocker', 'blocked_persona'], condition=models.Q(blocked__isnull=True),
+                name='unique_group_block',
+            ),
+        ]
 
 
 class Report(models.Model):
