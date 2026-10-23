@@ -1,0 +1,91 @@
+# Production stack: Caddy terminates TLS and proxies to the backend; Postgres
+# and Redis are reachable only on the Docker network. Media lives in
+# Cloudflare R2, so there's no MinIO here.
+#
+#   docker compose -f docker-compose.prod.yml up -d --build    (or: make deploy)
+#
+# DOMAIN and everything else come from .env next to this file.
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      DOMAIN: ${DOMAIN}
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./deploy/site:/srv/site:ro
+      - caddy_data:/data       # TLS certificates; keep across rebuilds
+      - caddy_config:/config
+    depends_on:
+      backend:
+        condition: service_healthy
+    logging: *logging
+
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    logging: *logging
+
+  # Channel layer and cache only; nothing here needs to survive a restart.
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    logging: *logging
+
+  backend:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      # Firebase service-account JSON; point FIREBASE_CREDENTIALS_FILE at
+      # /run/secrets/<file> in .env.
+      - ./secrets:/run/secrets:ro
+    healthcheck:
+      # Host header must be an ALLOWED_HOSTS entry.
+      test: ["CMD-SHELL", "python -c \"import os, urllib.request as u; u.urlopen(u.Request('http://localhost:3425/api/health/', headers={'Host': 'api.' + os.environ['DOMAIN']}), timeout=5)\""]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    logging: *logging
+
+volumes:
+  caddy_data:
+  caddy_config:
+  pg_data:

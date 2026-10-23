@@ -1,0 +1,21 @@
+# Caddy gets and renews TLS certificates for both hosts automatically.
+# {$DOMAIN} comes from the environment (docker-compose.prod.yml).
+
+# API, WebSockets (/ws/) and Django admin.
+api.{$DOMAIN} {
+	encode zstd gzip
+	reverse_proxy backend:3425
+}
+
+# The passkey RP ID: iOS and Android fetch the app association files here.
+# Anything else is the static site (landing and privacy pages).
+{$DOMAIN} {
+	encode zstd gzip
+	handle /.well-known/* {
+		reverse_proxy backend:3425
+	}
+	handle {
+		root * /srv/site
+		file_server
+	}
+}

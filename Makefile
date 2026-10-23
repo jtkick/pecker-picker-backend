@@ -7,11 +7,8 @@ down:
 logs:
 	docker compose logs -f backend
 
-seed:
-	docker compose exec backend python manage.py seed_test_users
-
-unseed:
-	docker compose exec backend python manage.py seed_test_users --clear
+demo:
+	docker compose exec backend python manage.py demo_users sync
 
 migrate:
 	docker compose exec backend python manage.py migrate
@@ -21,3 +18,20 @@ migrations:
 
 shell:
 	docker compose exec backend python manage.py shell
+
+# ── Production (on the server) ──────────────────────────────────────────────
+PROD = docker compose -f docker-compose.prod.yml
+
+deploy:
+	git pull --ff-only
+	$(PROD) up -d --build
+	$(PROD) ps
+
+prod-logs:
+	$(PROD) logs -f --tail=200 backend
+
+prod-shell:
+	$(PROD) exec backend python manage.py shell
+
+backup:
+	deploy/backup.sh

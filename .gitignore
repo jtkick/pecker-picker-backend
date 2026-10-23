@@ -8,3 +8,5 @@ db.sqlite3
 dist/
 build/
 .DS_Store
+secrets/
+deploy/ops.env

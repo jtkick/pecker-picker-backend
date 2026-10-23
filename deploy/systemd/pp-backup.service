@@ -1,0 +1,11 @@
+[Unit]
+Description=Pecker Picker: dump Postgres to R2
+After=docker.service
+
+[Service]
+Type=oneshot
+User=deploy
+WorkingDirectory=/srv/pecker-picker-backend
+# Healthchecks.io ping URL, if you set one up.
+EnvironmentFile=-/srv/pecker-picker-backend/deploy/ops.env
+ExecStart=/srv/pecker-picker-backend/deploy/backup.sh
