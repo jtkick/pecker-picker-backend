@@ -3,7 +3,7 @@ Push notifications via Firebase Cloud Messaging (covers APNs on iOS).
 
 Disabled unless FIREBASE_CREDENTIALS_FILE points at a service-account JSON.
 Notifications never include the sender, persona or message text — the lock
-screen only ever shows "New message" or "New invitation".
+screen only ever shows "New message", "New invitation" or a lifeline notice.
 """
 import logging
 import threading
@@ -90,3 +90,19 @@ def notify_persona_invite(user_id: int) -> None:
     transaction.on_commit(lambda: threading.Thread(
         target=_send, args=(targets, 'New invitation', 'invitations'), daemon=True,
     ).start())
+
+
+def notify_lifeline(targets: list[tuple[int, dict]], title: str, thread: str, background: bool = False) -> None:
+    """
+    After commit, push a lifeline warning or alert. The worker sends in its own
+    thread (`background=False`) so a shutdown can't drop an alert; requests
+    send in a daemon thread like the other notifications.
+    """
+    if not settings.FIREBASE_CREDENTIALS_FILE or not targets:
+        return
+    if background:
+        transaction.on_commit(lambda: threading.Thread(
+            target=_send, args=(targets, title, thread), daemon=True,
+        ).start())
+    else:
+        transaction.on_commit(lambda: _send(targets, title, thread))

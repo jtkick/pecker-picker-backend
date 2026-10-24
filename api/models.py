@@ -333,6 +333,16 @@ class Conversation(models.Model):
     class Meta:
         ordering = ['-updated_at']
 
+    @classmethod
+    def get_or_create_between(cls, a, b):
+        """The conversation `a` and `b` share, created as a 1:1 if there's none. Returns (conversation, created)."""
+        conv = cls.objects.filter(participants=a).filter(participants=b).first()
+        if conv is not None:
+            return conv, False
+        conv = cls.objects.create()
+        conv.participants.add(a, b)
+        return conv, True
+
 
 class ConversationMember(models.Model):
     """A persona's membership in a conversation, with its per-member read/delivery state."""
@@ -611,3 +621,44 @@ class WebAuthnChallenge(models.Model):
 
     def is_expired(self):
         return timezone.now() > self.expires_at
+
+
+class Lifeline(models.Model):
+    """
+    A safety check-in timer. If the owner doesn't snooze or end it by
+    `expires_at`, each recipient is sent an alert in their chat with `persona`
+    and given exact location for a day (see api.lifeline).
+    """
+    STATUS_ACTIVE, STATUS_ALERTED, STATUS_ENDED = 'active', 'alerted', 'ended'
+    STATUS_CHOICES = [(STATUS_ACTIVE, 'Active'), (STATUS_ALERTED, 'Alerted'), (STATUS_ENDED, 'Ended')]
+    END_REASON_CHOICES = [('manual', 'Manual'), ('arrived', 'Arrived home')]
+    OPEN = (STATUS_ACTIVE, STATUS_ALERTED)
+
+    user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='lifelines')
+    # The profile whose chats carry the alert; the active one when it started.
+    persona = models.ForeignKey(Persona, on_delete=models.CASCADE, related_name='+')
+    recipients = models.ManyToManyField(Persona, related_name='+')
+    status = models.CharField(max_length=10, choices=STATUS_CHOICES, default=STATUS_ACTIVE)
+    started_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField(db_index=True)
+    warned_at = models.DateTimeField(null=True, blank=True)
+    alerted_at = models.DateTimeField(null=True, blank=True)
+    ended_at = models.DateTimeField(null=True, blank=True)
+    end_reason = models.CharField(max_length=10, choices=END_REASON_CHOICES, blank=True)
+    # Last known position when the alert went out.
+    alert_lat = models.FloatField(null=True, blank=True)
+    alert_lng = models.FloatField(null=True, blank=True)
+    alert_location_at = models.DateTimeField(null=True, blank=True)
+    # Location grants the alert changed, keyed by grantee id: the prior
+    # {level, expires_at}, or null if it created the grant. Undone on check-in.
+    grant_restore = models.JSONField(default=dict, blank=True)
+
+    MAX_DURATION = timedelta(hours=24)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['user'], condition=models.Q(status__in=['active', 'alerted']),
+                name='one_open_lifeline',
+            ),
+        ]

@@ -63,6 +63,10 @@ urlpatterns = [
     path("phrases/", views.phrases, name="phrases"),
     path("phrases/<int:pk>/", views.phrase_delete, name="phrase-delete"),
     path("devices/", views.devices, name="devices"),
+    path("lifelines/", views.lifelines, name="lifelines"),
+    path("lifelines/current/", views.lifeline_current, name="lifeline-current"),
+    path("lifelines/<int:pk>/snooze/", views.lifeline_snooze, name="lifeline-snooze"),
+    path("lifelines/<int:pk>/end/", views.lifeline_end, name="lifeline-end"),
     path("kinks/", views.kinks_list, name="kinks-list"),
     path("interests/", views.interests_list, name="interests-list"),
 ]

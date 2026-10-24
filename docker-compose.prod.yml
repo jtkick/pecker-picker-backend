@@ -85,6 +85,23 @@ services:
         condition: service_healthy
     logging: *logging
 
+  # Lifeline warnings and alerts (api/lifeline.py). Same image; waits for the
+  # backend so its migrations have run.
+  lifeline:
+    build: .
+    restart: unless-stopped
+    entrypoint: ["python", "manage.py", "lifeline_worker"]
+    env_file: .env
+    environment:
+      POSTGRES_HOST: postgres
+      REDIS_URL: redis://redis:6379/0
+    volumes:
+      - ./secrets:/run/secrets:ro
+    depends_on:
+      backend:
+        condition: service_healthy
+    logging: *logging
+
 volumes:
   caddy_data:
   caddy_config:

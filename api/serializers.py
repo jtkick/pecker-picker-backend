@@ -2,7 +2,7 @@ import phonenumbers
 from django.db.models import Q
 from django.utils import timezone
 from rest_framework import serializers
-from .models import User, Persona, PersonaMember, ProfileImage, Album, AlbumGrant, Conversation, Message, LocationShareGrant, FaceVerification
+from .models import User, Persona, PersonaMember, ProfileImage, Album, AlbumGrant, Conversation, Message, LocationShareGrant, FaceVerification, Lifeline
 from . import discover
 from .geo import fuzz_coords
 from .membership import in_use
@@ -389,6 +389,19 @@ class LocationShareGrantSerializer(serializers.ModelSerializer):
         model = LocationShareGrant
         fields = ['id', 'grantee_id', 'level', 'expires_at', 'created_at']
         read_only_fields = ['id', 'created_at']
+
+
+class LifelineSerializer(serializers.ModelSerializer):
+    persona_id = serializers.IntegerField(read_only=True)
+    recipients = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Lifeline
+        fields = ['id', 'persona_id', 'recipients', 'status', 'started_at', 'expires_at',
+                  'alerted_at', 'ended_at', 'end_reason']
+
+    def get_recipients(self, obj):
+        return [{'id': p.pk, 'display_name': p.display_name} for p in obj.recipients.all()]
 
 
 def _shown_as(member: PersonaMember) -> Persona | None:

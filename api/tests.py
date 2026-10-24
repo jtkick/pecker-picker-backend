@@ -23,10 +23,10 @@ from django.core.management import call_command
 from django.core.management.base import CommandError
 
 from pecker_picker.asgi import application
-from . import discover, geo
+from . import discover, geo, lifeline
 from .media import presigned_url, strip_image_metadata
 from .models import (
-    Album, AlbumGrant, Block, Conversation, ConversationMember, DeviceToken, DiscoverEvent, LocationShareGrant,
+    Album, AlbumGrant, Block, Conversation, ConversationMember, DeviceToken, DiscoverEvent, Lifeline, LocationShareGrant,
     Message, OTPVerification, Persona, PersonaMember, PersonaPhoto, ProfileImage, Report, User,
     WebAuthnChallenge,
 )
@@ -1028,3 +1028,104 @@ class PruneTests(APITestCase):
         call_command('prune', stdout=io.StringIO())
         self.assertEqual(list(WebAuthnChallenge.objects.values_list('pk', flat=True)), [fresh.pk])
         self.assertFalse(OTPVerification.objects.exists())
+
+
+@override_settings(FIREBASE_CREDENTIALS_FILE='creds.json')
+class LifelineTests(MessagingTestCase):
+    def setUp(self):
+        super().setUp()
+        self.carol, self.carol_main = make_user('+15550100103', 'Carol')
+        push = mock.patch('api.push._send')
+        self.push = push.start()
+        self.addCleanup(push.stop)
+
+    def start(self, ids=None, minutes=60):
+        self.as_user(self.alice)
+        return self.client.post('/api/lifelines/', {
+            'recipient_persona_ids': ids or [self.bob_main.pk], 'duration_minutes': minutes,
+        }, format='json')
+
+    def run_alert(self, lifeline_id):
+        Lifeline.objects.filter(pk=lifeline_id).update(expires_at=timezone.now() - timedelta(seconds=1))
+        with self.captureOnCommitCallbacks(execute=True):
+            return lifeline.alert_due()
+
+    def test_recipients_must_be_chat_partners(self):
+        self.assertEqual(self.start([self.carol_main.pk]).status_code, 400)
+        Block.objects.create(blocker=self.bob, blocked=self.alice)
+        self.assertEqual(self.start().status_code, 400)
+
+    def test_one_open_lifeline(self):
+        self.assertEqual(self.start().status_code, 201)
+        self.assertEqual(self.start().status_code, 409)
+        current = self.client.get('/api/lifelines/current/').data
+        self.assertEqual(current['lifeline']['recipients'], [{'id': self.bob_main.pk, 'display_name': 'Bob'}])
+
+    def test_snooze_extends_resets_warning_and_caps(self):
+        res = self.start(minutes=12 * 60)
+        Lifeline.objects.filter(pk=res.data['id']).update(warned_at=timezone.now())
+        url = f"/api/lifelines/{res.data['id']}/snooze/"
+        for _ in range(20):
+            self.client.post(url, {'minutes': 60}, format='json')
+        row = Lifeline.objects.get(pk=res.data['id'])
+        self.assertIsNone(row.warned_at)
+        self.assertEqual(row.expires_at, row.started_at + Lifeline.MAX_DURATION)
+        self.assertEqual(self.client.post(url, {'minutes': 5}, format='json').status_code, 400)
+
+    def test_warns_once(self):
+        res = self.start(minutes=15)
+        Lifeline.objects.filter(pk=res.data['id']).update(expires_at=timezone.now() + timedelta(minutes=5))
+        with self.captureOnCommitCallbacks(execute=True):
+            lifeline.warn_due()
+            lifeline.warn_due()
+        self.assertEqual(self.push.call_count, 1)
+        self.assertEqual(self.push.call_args.args[0][0][0], self.alice.pk)
+
+    def test_nothing_sent_before_expiry(self):
+        self.start()
+        with self.captureOnCommitCallbacks(execute=True):
+            self.assertEqual(lifeline.alert_due(), 0)
+        self.assertFalse(Message.objects.exists())
+        self.assertFalse(LocationShareGrant.objects.exists())
+
+    def test_alert_posts_message_shares_location_and_pushes(self):
+        res = self.start()
+        with mock.patch('api.realtime.send_to_users'):
+            self.assertEqual(self.run_alert(res.data['id']), 1)
+        msg = Message.objects.get()
+        self.assertEqual((msg.conversation_id, msg.sender_id, msg.kind), (self.conv.pk, self.alice_main.pk, 'system'))
+        self.assertEqual(msg.metadata['type'], 'lifeline.alert')
+        self.assertEqual((msg.metadata['lat'], msg.metadata['lng']), (39.1, -84.5))
+        grant = LocationShareGrant.objects.get(grantor=self.alice_main, grantee=self.bob_main)
+        self.assertEqual(grant.level, 2)
+        self.assertEqual([t[0] for t in self.push.call_args.args[0]], [self.bob.pk])
+        self.assertEqual(Lifeline.objects.get().status, Lifeline.STATUS_ALERTED)
+
+    def test_safe_check_in_restores_grants(self):
+        ConversationMember.objects.filter(persona=self.bob_main).update(muted_until=timezone.now() + timedelta(days=1))
+        conv = Conversation.objects.create()
+        conv.participants.add(self.alice_main, self.carol_main)
+        permanent = LocationShareGrant.objects.create(grantor=self.alice_main, grantee=self.carol_main, level=2)
+        res = self.start([self.bob_main.pk, self.carol_main.pk])
+        with mock.patch('api.realtime.send_to_users'):
+            self.run_alert(res.data['id'])
+            # Muted chats still get the alert.
+            self.assertEqual(sorted(t[0] for t in self.push.call_args.args[0]), [self.bob.pk, self.carol.pk])
+            with self.captureOnCommitCallbacks(execute=True):
+                ended = self.client.post(f"/api/lifelines/{res.data['id']}/end/", {'reason': 'manual'}, format='json')
+        self.assertEqual(ended.data['status'], 'ended')
+        self.assertEqual(Message.objects.filter(metadata__type='lifeline.safe').count(), 2)
+        self.assertEqual(list(LocationShareGrant.objects.values_list('pk', 'expires_at')), [(permanent.pk, None)])
+
+    def test_end_before_expiry_is_silent(self):
+        res = self.start()
+        self.client.post(f"/api/lifelines/{res.data['id']}/end/", {'reason': 'arrived'}, format='json')
+        with self.captureOnCommitCallbacks(execute=True):
+            lifeline.alert_due()
+        self.assertFalse(Message.objects.exists())
+        self.assertEqual(Lifeline.objects.get().end_reason, 'arrived')
+
+    def test_other_users_cannot_touch_it(self):
+        res = self.start()
+        self.as_user(self.bob)
+        self.assertEqual(self.client.post(f"/api/lifelines/{res.data['id']}/end/").status_code, 404)

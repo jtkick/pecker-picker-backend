@@ -42,13 +42,13 @@ from webauthn.helpers.structs import (
     UserVerificationRequirement,
     AttestationConveyancePreference,
 )
-from .models import User, Persona, PersonaMember, PersonaPhoto, DiscoverEvent, ProfileImage, Album, AlbumGrant, Conversation, ConversationMember, DeviceToken, Message, MessageAttachment, MessageReaction, SavedPhrase, LocationShareGrant, Block, Report, FaceVerification, Kink, Interest, PasskeyCredential, WebAuthnChallenge, OTPVerification
+from .models import User, Persona, PersonaMember, PersonaPhoto, DiscoverEvent, ProfileImage, Album, AlbumGrant, Conversation, ConversationMember, DeviceToken, Message, MessageAttachment, MessageReaction, SavedPhrase, LocationShareGrant, Block, Report, FaceVerification, Kink, Interest, PasskeyCredential, WebAuthnChallenge, OTPVerification, Lifeline
 from .sms import send_otp_sms, send_verify_sms, check_verify_sms
 from .serializers import (
     AccountSerializer, PersonaSummarySerializer, PersonaSerializer,
     GalleryImageSerializer, DiscoverPersonaSerializer, PersonaProfileSerializer,
     AlbumSerializer, AlbumGrantSerializer, LocationShareGrantSerializer, ConversationSerializer, MessageSerializer,
-    GroupMemberSerializer, InvitationSerializer, persona_verified,
+    GroupMemberSerializer, InvitationSerializer, LifelineSerializer, persona_verified,
 )
 from . import discover
 from .membership import (
@@ -57,6 +57,7 @@ from .membership import (
 from .geocoding import reverse_geocode, nearby_label
 from .tagging import auto_tag
 from .media import strip_image_metadata
+from .lifeline import end as end_lifeline
 from .push import notify_new_message, notify_persona_invite
 from .realtime import broadcast, mark_receipt, member_user_ids, send_to_users
 from django.conf import settings
@@ -1341,6 +1342,92 @@ def location_grant_delete(request, pk):
     return Response(status=status.HTTP_204_NO_CONTENT)
 
 
+# ── Lifeline ──────────────────────────────────────────────────────────────────
+
+LIFELINE_MINUTES = (15, 12 * 60)
+LIFELINE_SNOOZES = (15, 30, 60)
+LIFELINE_MAX_RECIPIENTS = 10
+
+
+def _open_lifeline(user):
+    return Lifeline.objects.filter(user=user, status__in=Lifeline.OPEN).prefetch_related('recipients').first()
+
+
+@api_view(['GET'])
+def lifeline_current(request):
+    """My open lifeline (or null), and who the last one went to, to prefill the picker."""
+    lifeline = _open_lifeline(request.user)
+    last = Lifeline.objects.filter(user=request.user).order_by('-started_at').first()
+    return Response({
+        'lifeline': LifelineSerializer(lifeline).data if lifeline else None,
+        'last_recipient_ids': list(last.recipients.values_list('pk', flat=True)) if last else [],
+    })
+
+
+@api_view(['POST'])
+def lifelines(request):
+    """Start a lifeline from my active persona to people it already chats with."""
+    me = request.user.get_active_persona()
+    try:
+        minutes = int(request.data.get('duration_minutes'))
+        if not LIFELINE_MINUTES[0] <= minutes <= LIFELINE_MINUTES[1]:
+            raise ValueError
+    except (TypeError, ValueError):
+        return Response({'error': 'duration_minutes must be between 15 and 720.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    ids = request.data.get('recipient_persona_ids')
+    if not isinstance(ids, list) or not 1 <= len(set(ids)) <= LIFELINE_MAX_RECIPIENTS:
+        return Response({'error': f'Pick 1 to {LIFELINE_MAX_RECIPIENTS} people.'}, status=status.HTTP_400_BAD_REQUEST)
+    recipients = []
+    for pk in set(ids):
+        other = _visible_persona(request, pk)
+        if other is None or not Conversation.objects.filter(participants=me).filter(participants=other).exists():
+            return Response({'error': 'You can only pick people you chat with.'}, status=status.HTTP_400_BAD_REQUEST)
+        recipients.append(other)
+
+    try:
+        with transaction.atomic():
+            lifeline = Lifeline.objects.create(
+                user=request.user, persona=me, expires_at=timezone.now() + timedelta(minutes=minutes),
+            )
+            lifeline.recipients.set(recipients)
+    except IntegrityError:
+        return Response({'error': 'You already have a lifeline running.'}, status=status.HTTP_409_CONFLICT)
+    return Response(LifelineSerializer(_open_lifeline(request.user)).data, status=status.HTTP_201_CREATED)
+
+
+@api_view(['POST'])
+def lifeline_snooze(request, pk):
+    try:
+        minutes = int(request.data.get('minutes'))
+        if minutes not in LIFELINE_SNOOZES:
+            raise ValueError
+    except (TypeError, ValueError):
+        return Response({'error': 'minutes must be 15, 30 or 60.'}, status=status.HTTP_400_BAD_REQUEST)
+    with transaction.atomic():
+        lifeline = get_object_or_404(Lifeline.objects.select_for_update(), pk=pk, user=request.user)
+        if lifeline.status != Lifeline.STATUS_ACTIVE:
+            return Response({'error': 'This lifeline is no longer running.'}, status=status.HTTP_409_CONFLICT)
+        lifeline.expires_at = min(
+            max(lifeline.expires_at, timezone.now()) + timedelta(minutes=minutes),
+            lifeline.started_at + Lifeline.MAX_DURATION,
+        )
+        lifeline.warned_at = None
+        lifeline.save(update_fields=['expires_at', 'warned_at'])
+    return Response(LifelineSerializer(_open_lifeline(request.user)).data)
+
+
+@api_view(['POST'])
+def lifeline_end(request, pk):
+    """I'm home or safe. After an alert this also tells the recipients."""
+    lifeline = get_object_or_404(Lifeline, pk=pk, user=request.user)
+    reason = request.data.get('reason', 'manual')
+    if reason not in dict(Lifeline.END_REASON_CHOICES):
+        return Response({'error': 'reason must be manual or arrived.'}, status=status.HTTP_400_BAD_REQUEST)
+    lifeline = end_lifeline(lifeline, reason)
+    return Response(LifelineSerializer(lifeline).data)
+
+
 # ── Conversations ─────────────────────────────────────────────────────────────
 
 def _conversation_qs(me):
@@ -1448,16 +1535,8 @@ def conversations(request):
     if other is None:
         return Response({'error': 'User not found.'}, status=status.HTTP_404_NOT_FOUND)
 
-    conv = (
-        Conversation.objects
-        .filter(participants=me)
-        .filter(participants=other)
-        .first()
-    )
-    created = conv is None
+    conv, created = Conversation.get_or_create_between(me, other)
     if created:
-        conv = Conversation.objects.create()
-        conv.participants.add(me, other)
         _log_discover_event(request, me, other, DiscoverEvent.KIND_MESSAGED)
 
     return Response(
