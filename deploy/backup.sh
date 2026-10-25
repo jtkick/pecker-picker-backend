@@ -12,6 +12,13 @@ docker compose -f docker-compose.prod.yml exec -T postgres \
     sh -c 'pg_dump -Fc -U "$POSTGRES_USER" "$POSTGRES_DB"' \
     | rclone rcat "r2:$bucket/pg/$stamp.dump"
 
-echo "Backed up to r2:$bucket/pg/$stamp.dump"
+# The rclone remote sets no_head (R2 can't answer rclone's post-upload check),
+# so confirm the dump landed; an empty database still dumps to several KB.
+size=$(rclone lsf --format s "r2:$bucket/pg/$stamp.dump")
+if [ "${size:-0}" -lt 1024 ]; then
+    echo "Backup missing or too small in R2 (${size:-0} bytes)" >&2
+    exit 1
+fi
+echo "Backed up to r2:$bucket/pg/$stamp.dump ($size bytes)"
 # Optional dead-man's switch (Healthchecks.io): alerts if this stops running.
 if [ -n "${HEALTHCHECK_URL:-}" ]; then curl -fsS -m 10 -o /dev/null "$HEALTHCHECK_URL"; fi
