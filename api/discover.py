@@ -17,6 +17,7 @@ import random
 import secrets
 from datetime import timedelta
 
+from django.conf import settings
 from django.core.cache import cache
 from django.db.models import ExpressionWrapper, F, FloatField, Q
 from django.db.models.functions import Coalesce
@@ -321,7 +322,8 @@ def rank(qs, viewer_user, viewer_persona, *, sort='recommended', filters=None, r
         m = PREFILTER_MARGIN_DEG
         qs = qs.filter(lat__range=(bbox[0] - m, bbox[2] + m), lng__range=(bbox[1] - m, bbox[3] + m))
     elif has_origin:
-        qs = qs.filter(_bbox_q(origin, radius_km + PREFILTER_MARGIN_KM))
+        nearby = _bbox_q(origin, radius_km + PREFILTER_MARGIN_KM)
+        qs = qs.filter(nearby | Q(user__demo_handle__isnull=False) if settings.DEMO_PROFILES_FOR_EVERYONE else nearby)
     if has_origin:
         # Keep the nearest when there are more than MAX_CANDIDATES.
         d2 = (F('lat') - origin[0]) * (F('lat') - origin[0]) + (F('lng') - origin[1]) * (F('lng') - origin[1])
@@ -343,7 +345,9 @@ def rank(qs, viewer_user, viewer_persona, *, sort='recommended', filters=None, r
         )):
             continue
         km = geo.haversine_km(origin, where) if has_origin and where is not None else None
-        if bbox is None and km is not None and km > radius_km:
+        if bbox is None and km is not None and km > radius_km and not (
+            settings.DEMO_PROFILES_FOR_EVERYONE and _is_demo(persona)
+        ):
             continue
         score = (
             WEIGHTS['compat'] * compat(viewer_persona, persona)

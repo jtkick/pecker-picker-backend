@@ -12,7 +12,7 @@ from django.core.files.uploadedfile import SimpleUploadedFile
 from django.test import override_settings
 from django.utils import timezone
 from PIL import Image
-from rest_framework_simplejwt.tokens import AccessToken
+from rest_framework_simplejwt.tokens import AccessToken, RefreshToken
 from rest_framework.test import APITestCase, APITransactionTestCase
 
 import tempfile
@@ -27,7 +27,7 @@ from . import discover, geo, lifeline
 from .media import presigned_url, strip_image_metadata
 from .models import (
     Album, AlbumGrant, Block, Conversation, ConversationMember, DeviceToken, DiscoverEvent, Lifeline, LocationShareGrant,
-    Message, OTPVerification, Persona, PersonaMember, PersonaPhoto, ProfileImage, Report, User,
+    Message, MessageAttachment, OTPVerification, Persona, PersonaMember, PersonaPhoto, ProfileImage, Report, User,
     WebAuthnChallenge,
 )
 from .views import DiscoverThrottle
@@ -525,6 +525,14 @@ class DemoUserTests(PersonaTestCase):
         cache.clear()
         result = next(p for p in self.client.get('/api/discover/').data['results'] if p['id'] == river.pk)
         self.assertTrue(result['is_demo'])
+
+    def test_beta_switch_shows_them_to_everyone_at_any_distance(self, _):
+        self.sync(self.RIVER)
+        river = User.objects.get(demo_handle='river').get_active_persona()
+        far, _persona = make_user('+15550100109', 'Reviewer', lat=37.33, lng=-122.03)   # Cupertino
+        self.assertNotIn(river.pk, self.feed_ids(far))
+        with self.settings(DEMO_PROFILES_FOR_EVERYONE=True):
+            self.assertIn(river.pk, self.feed_ids(far))
 
     def test_switching_off_and_on(self, _):
         self.sync(self.RIVER)
@@ -1161,3 +1169,67 @@ class OtpSendFailureTests(APITestCase):
             r = self.client.post('/api/auth/otp/request/', {'phone_number': '+1555'})
         self.assertEqual(r.status_code, 503)
         self.assertEqual(r.data['detail'], "We couldn't send a code to that number.")
+
+
+@override_settings(STORAGES={
+    'default': {'BACKEND': 'django.core.files.storage.InMemoryStorage'},
+    'staticfiles': {'BACKEND': 'django.contrib.staticfiles.storage.StaticFilesStorage'},
+})
+class AccountDeletionTests(PersonaTestCase):
+    def setUp(self):
+        super().setUp()
+        from django.core.files.base import ContentFile
+        from django.core.files.storage import default_storage
+        self.storage = default_storage
+        self.carol, self.carol_main = make_user('+15550100103', 'Carol')
+        self.photo = ProfileImage.objects.create(user=self.alice, image=ContentFile(b'a', name='a.jpg'))
+        self.ab = Conversation.objects.create()
+        self.ab.participants.add(self.alice_main, self.bob_main)
+        Message.objects.create(conversation=self.ab, sender=self.alice_main, sender_user=self.alice, body='hi')
+        from_bob = Message.objects.create(conversation=self.ab, sender=self.bob_main, sender_user=self.bob, kind='image')
+        self.bob_photo = MessageAttachment.objects.create(
+            message=from_bob, mime='image/jpeg', file=ContentFile(b'b', name='b.jpg'),
+        )
+        self.bc = Conversation.objects.create()
+        self.bc.participants.add(self.bob_main, self.carol_main)
+        self.bob_to_carol = Message.objects.create(conversation=self.bc, sender=self.bob_main, sender_user=self.bob)
+        # Sent by Alice as a member of a group persona someone else owns.
+        self.as_group = Message.objects.create(conversation=self.bc, sender=self.bob_main, sender_user=self.alice)
+
+    def delete_alice(self):
+        self.as_user(self.alice)
+        with self.captureOnCommitCallbacks(execute=True):
+            return self.client.delete('/api/me/')
+
+    def test_deletes_account_conversations_messages_and_files(self):
+        files = [self.photo.image.name, self.bob_photo.file.name]
+        refresh = RefreshToken.for_user(self.alice)
+        self.assertEqual(self.delete_alice().status_code, 204)
+
+        self.assertFalse(User.objects.filter(pk=self.alice.pk).exists())
+        self.assertFalse(Persona.objects.filter(pk=self.alice_main.pk).exists())
+        self.assertFalse(Conversation.objects.filter(pk=self.ab.pk).exists())
+        self.assertFalse(Message.objects.filter(pk=self.as_group.pk).exists())
+        self.assertEqual([n for n in files if self.storage.exists(n)], [])
+        self.client.force_authenticate(None)
+        r = self.client.post('/api/auth/token/refresh/', {'refresh': str(refresh)})
+        self.assertEqual(r.status_code, 401)
+
+    def test_other_peoples_conversations_stay(self):
+        self.delete_alice()
+        self.assertTrue(User.objects.filter(pk=self.bob.pk).exists())
+        self.assertEqual(list(self.bc.messages.values_list('pk', flat=True)), [self.bob_to_carol.pk])
+
+    @override_settings(STRIPE_SECRET_KEY='sk_test_x')
+    def test_cancels_subscription_first_and_keeps_account_if_that_fails(self):
+        import stripe
+        User.objects.filter(pk=self.alice.pk).update(stripe_subscription_id='sub_1')
+        self.alice.refresh_from_db()
+        with mock.patch('stripe.Subscription.cancel', side_effect=stripe.APIConnectionError('down')) as cancel:
+            r = self.delete_alice()
+        cancel.assert_called_once_with('sub_1')
+        self.assertEqual(r.status_code, 503)
+        self.assertTrue(User.objects.filter(pk=self.alice.pk).exists())
+        with mock.patch('stripe.Subscription.cancel') as cancel:
+            self.assertEqual(self.delete_alice().status_code, 204)
+        cancel.assert_called_once_with('sub_1')

@@ -56,6 +56,7 @@ from .membership import (
 )
 from .geocoding import reverse_geocode, nearby_label
 from .tagging import auto_tag
+from .account import AccountDeletionError, delete_account
 from .media import strip_image_metadata
 from .lifeline import end as end_lifeline
 from .push import notify_new_message, notify_persona_invite
@@ -526,8 +527,14 @@ def credentials(request):
     })
 
 
-@api_view(["GET", "PATCH"])
+@api_view(["GET", "PATCH", "DELETE"])
 def me(request):
+    if request.method == "DELETE":
+        try:
+            delete_account(request.user)
+        except AccountDeletionError as exc:
+            return Response({'detail': str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
+        return Response(status=status.HTTP_204_NO_CONTENT)
     ctx = {'request': request}
     request.user.get_active_persona()
     if request.method == "GET":
@@ -575,8 +582,8 @@ def _hidden_persona_q(user):
     """
     blocked_by_me, blocked_me = _block_exclusions(user)
     members = PersonaMember.objects.filter(status=ACCEPTED)
-    # Demo accounts are only for testers; real members never see them.
-    demo = Q() if user.is_tester else Q(user__demo_handle__isnull=False)
+    # Demo accounts are only for testers (or everyone, during the beta).
+    demo = Q() if user.is_tester or settings.DEMO_PROFILES_FOR_EVERYONE else Q(user__demo_handle__isnull=False)
     return (
         demo
         | Q(pk__in=personas_for(user).values('pk'))

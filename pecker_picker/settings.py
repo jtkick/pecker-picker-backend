@@ -179,6 +179,10 @@ MAX_CHAT_IMAGES = 4      # photos per message
 
 # Keyed by User.TIER_* (0 = Free, 1 = Plus).
 PERSONA_LIMITS = {0: 2, 1: 12}
+
+# Beta only: every account sees demo profiles (not just testers), at any
+# distance, so new testers and App Review have something to browse.
+DEMO_PROFILES_FOR_EVERYONE = os.environ.get("DEMO_PROFILES_FOR_EVERYONE", "False") == "True"
 LIBRARY_LIMITS = {0: 30, 1: 200}
 
 # ── AWS Rekognition (image auto-tagging) ─────────────────────────────────────
