@@ -477,6 +477,7 @@ class DiscoverFeedTests(PersonaTestCase):
     'default': {'BACKEND': 'django.core.files.storage.InMemoryStorage'},
     'staticfiles': {'BACKEND': 'django.contrib.staticfiles.storage.StaticFilesStorage'},
 })
+@mock.patch('api.management.commands.demo_users.GEOCODE_INTERVAL', 0)
 @mock.patch('api.management.commands.demo_users.reverse_geocode', return_value='Downtown')
 class DemoUserTests(PersonaTestCase):
     RIVER = {
@@ -533,6 +534,29 @@ class DemoUserTests(PersonaTestCase):
         self.assertNotIn(river.pk, self.feed_ids(far))
         with self.settings(DEMO_PROFILES_FOR_EVERYONE=True):
             self.assertIn(river.pk, self.feed_ids(far))
+
+    def test_check_reports_problems_and_changes_nothing(self, _):
+        from api.models import Kink
+        Kink.objects.create(name='Rope bondage')
+        (self.dir / 'photos' / 'river' / 'bad.jpg').write_bytes(b'not an image')
+        entry = {**self.RIVER, 'kinks': ['Rope bondage', 'Rope bondge'],
+                 'photos': [{'file': '1.png'}, {'file': 'bad.jpg'}]}
+        (self.dir / 'users.json').write_text(json.dumps([entry]))
+        with self.assertRaisesMessage(CommandError, 'unknown kink "Rope bondge"') as ctx:
+            call_command('demo_users', 'sync', '--check', dir=str(self.dir), stdout=io.StringIO())
+        self.assertIn('bad.jpg is not a readable image', str(ctx.exception))
+        (self.dir / 'users.json').write_text(json.dumps([{**self.RIVER, 'kinks': ['Rope bondage']}]))
+        out = io.StringIO()
+        call_command('demo_users', 'sync', '--check', dir=str(self.dir), stdout=out)
+        self.assertIn('1 demo users and 1 photos look good', out.getvalue())
+        self.assertFalse(User.objects.filter(demo_handle='river').exists())
+
+    def test_wildcard_removes_all_synthetic(self, _):
+        self.sync(self.RIVER)
+        call_command('demo_users', 'synthetic', '3', stdout=io.StringIO())
+        call_command('demo_users', 'remove', 'synthetic_*', stdout=io.StringIO())
+        self.assertEqual(list(User.objects.filter(demo_handle__isnull=False).values_list('demo_handle', flat=True)),
+                         ['river'])
 
     def test_switching_off_and_on(self, _):
         self.sync(self.RIVER)

@@ -3,8 +3,9 @@ Handmade demo users, so there's something to browse while real members are
 few. Only tester accounts ever see them (`demo_users tester add`), and each
 can be switched on and off. They never fade from discover while on.
 
-Define them in api/demo/users.json (a list), with each user's photos in
-api/demo/photos/<handle>/. Every field except handle and display_name is optional:
+Define them in a folder holding users.json (a list) and each user's photos in
+photos/<handle>/ (api/demo by default, or --dir; deploy/demo-profiles.sh syncs
+a private folder to production). Every field except handle and display_name is optional:
 
     [
       {
@@ -38,32 +39,48 @@ api/demo/photos/<handle>/. Every field except handle and display_name is optiona
   power             sub | sub_switch | switch | dom_switch | dom
   location_sharing  off | general | exact
   photo tags        face | torso | explicit | other
+  kinks, interests  names exactly as in the app's lists (seed_kinks / seed_interests)
 
 Usage:
     manage.py demo_users sync                    create/update everyone in the file
+    manage.py demo_users sync --check            only report problems; change nothing
     manage.py demo_users list
     manage.py demo_users on  [HANDLE ...]        switch on (everyone if none given)
     manage.py demo_users off [HANDLE ...]        switch off
-    manage.py demo_users remove HANDLE ...       delete users and their photos
+    manage.py demo_users remove HANDLE ...       delete users and their photos ("synthetic_*" for all synthetic)
     manage.py demo_users tester add|remove USER  USER is a user id or phone number
     manage.py demo_users synthetic N [--near LAT,LNG]   N random demo users (no photos)
 """
 import json
 import random
 import re
+import time
 from datetime import timedelta
 from pathlib import Path
 
 from django.core.management.base import BaseCommand, CommandError
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
+from PIL import Image, UnidentifiedImageError
 
 from api.discover import FRESHNESS
 from api.geocoding import reverse_geocode
 from api.media import strip_image_metadata
-from api.models import Persona, PersonaPhoto, ProfileImage, User
+from api.models import Interest, Kink, Persona, PersonaPhoto, ProfileImage, User
 
 DEMO_DIR = Path(__file__).resolve().parents[2] / 'demo'
+
+GEOCODE_INTERVAL = 1.1   # seconds; Nominatim allows 1 request/second
+_last_geocode = 0.0
+
+
+def _neighborhood(lat: float, lng: float) -> str:
+    """reverse_geocode, at most once a second (Nominatim's usage policy)."""
+    global _last_geocode
+    time.sleep(max(0.0, _last_geocode + GEOCODE_INTERVAL - time.monotonic()))
+    _last_geocode = time.monotonic()
+    return reverse_geocode(lat, lng)
 
 POSITIONS = {'bottom': 0, 'vers_bottom': 1, 'vers': 2, 'vers_top': 3, 'top': 4}
 POWERS = {'sub': 0, 'sub_switch': 1, 'switch': 2, 'dom_switch': 3, 'dom': 4}
@@ -109,6 +126,23 @@ def _image_name(handle: str, file: str) -> str:
     return f'demo_{handle}_{path.stem}{ext}'
 
 
+def _unknown_names(entries: list[dict], field: str, model) -> list[str]:
+    known = set(model.objects.values_list('name', flat=True))
+    return [
+        f'{e.get("handle", "?")}: unknown {field[:-1]} "{name}"'
+        for e in entries for name in e.get(field) or () if name not in known
+    ]
+
+
+def _readable(path: Path) -> bool:
+    try:
+        with Image.open(path) as img:
+            img.verify()
+        return True
+    except (UnidentifiedImageError, OSError):
+        return False
+
+
 class Command(BaseCommand):
     help = 'Handmade demo users that only tester accounts see. Run with no arguments for help.'
 
@@ -116,6 +150,7 @@ class Command(BaseCommand):
         parser.add_argument('action', nargs='?', choices=['sync', 'list', 'on', 'off', 'remove', 'tester', 'synthetic'])
         parser.add_argument('args', nargs='*', metavar='NAME')
         parser.add_argument('--dir', default=str(DEMO_DIR), help='Folder holding users.json and photos/.')
+        parser.add_argument('--check', action='store_true', help='With sync: report problems, change nothing.')
         parser.add_argument('--near', default='39.1,-84.5', help='Center for synthetic users as LAT,LNG.')
 
     def handle(self, *args, action=None, **options):
@@ -125,7 +160,7 @@ class Command(BaseCommand):
         names = list(args)   # Django passes the `args` positionals separately
         match action:
             case 'sync':
-                self._sync(Path(options['dir']))
+                self._sync(Path(options['dir']), check_only=options['check'])
             case 'list':
                 self._list()
             case 'on' | 'off':
@@ -146,7 +181,7 @@ class Command(BaseCommand):
 
     # ── sync ─────────────────────────────────────────────────────────────────
 
-    def _sync(self, folder: Path):
+    def _sync(self, folder: Path, check_only: bool = False):
         path = folder / 'users.json'
         if not path.exists():
             raise CommandError(f'{path} not found.')
@@ -164,8 +199,19 @@ class Command(BaseCommand):
             for e in entries for p in e.get('photos') or ()
             if not (folder / 'photos' / e['handle'] / p['file']).exists()
         ]
+        problems += _unknown_names(entries, 'kinks', Kink) + _unknown_names(entries, 'interests', Interest)
+        problems += [
+            f'{e["handle"]}: photo {p["file"]} is not a readable image (use JPEG, PNG or WebP)'
+            for e in entries for p in e.get('photos') or ()
+            if (folder / 'photos' / e['handle'] / p['file']).exists()
+            and not _readable(folder / 'photos' / e['handle'] / p['file'])
+        ]
         if problems:
             raise CommandError('users.json has problems:\n  ' + '\n  '.join(problems))
+        if check_only:
+            photos = sum(len(e.get('photos') or ()) for e in entries)
+            self.stdout.write(self.style.SUCCESS(f'✓ {len(entries)} demo users and {photos} photos look good.'))
+            return
         for entry in entries:
             self._sync_one(entry, folder / 'photos' / entry['handle'])
         self.stdout.write(self.style.SUCCESS(f'✓ {len(entries)} demo users synced.'))
@@ -181,7 +227,7 @@ class Command(BaseCommand):
         if location != (user.latitude, user.longitude):
             user.latitude, user.longitude = location
             user.location_updated_at = timezone.now()
-            user.neighborhood = reverse_geocode(*location) if None not in location else ''
+            user.neighborhood = _neighborhood(*location) if None not in location else ''
         user.pronouns = e.get('pronouns') or ''
         user.height, user.length = e.get('height'), e.get('length')
         user.save()
@@ -235,12 +281,16 @@ class Command(BaseCommand):
     # ── switching & housekeeping ─────────────────────────────────────────────
 
     def _demo_users(self, handles):
+        """Demo users by handle; a trailing * matches a prefix (e.g. "synthetic_*")."""
         users = User.objects.filter(demo_handle__isnull=False)
         if handles:
-            missing = set(handles) - set(users.filter(demo_handle__in=handles).values_list('demo_handle', flat=True))
-            if missing:
-                raise CommandError(f'No demo users named {", ".join(sorted(missing))}.')
-            users = users.filter(demo_handle__in=handles)
+            match = Q()
+            for h in handles:
+                q = Q(demo_handle__startswith=h[:-1]) if h.endswith('*') else Q(demo_handle=h)
+                if not users.filter(q).exists():
+                    raise CommandError(f'No demo users named {h}.')
+                match |= q
+            users = users.filter(match)
         return users
 
     def _switch(self, handles, on: bool):
