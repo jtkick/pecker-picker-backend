@@ -7,7 +7,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-bucket=${BACKUP_BUCKET:-pecker-picker-backups}
+bucket=${BACKUP_BUCKET:-stoke-backups}
 compose="docker compose -f docker-compose.prod.yml"
 
 if [ $# -eq 0 ]; then

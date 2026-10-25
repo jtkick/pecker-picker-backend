@@ -1,9 +1,9 @@
 [Unit]
-Description=Pecker Picker: delete expired auth rows and blacklisted tokens
+Description=Stoke: delete expired auth rows and blacklisted tokens
 After=docker.service
 
 [Service]
 Type=oneshot
 User=deploy
-WorkingDirectory=/srv/pecker-picker-backend
+WorkingDirectory=/srv/stoke
 ExecStart=/usr/bin/docker compose -f docker-compose.prod.yml exec -T backend sh -c "python manage.py prune && python manage.py flushexpiredtokens"

@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Dump Postgres straight to R2. Run nightly by deploy/systemd/pp-backup.timer.
+# Dump Postgres straight to R2. Run nightly by deploy/systemd/stoke-backup.timer.
 # Needs an rclone remote named "r2" on the host (`rclone config`); R2's
 # lifecycle rule on the bucket expires old dumps.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-bucket=${BACKUP_BUCKET:-pecker-picker-backups}
+bucket=${BACKUP_BUCKET:-stoke-backups}
 stamp=$(date -u +%Y%m%dT%H%M%SZ)
 
 docker compose -f docker-compose.prod.yml exec -T postgres \
