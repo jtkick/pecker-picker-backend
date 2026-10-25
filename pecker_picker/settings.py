@@ -1,4 +1,5 @@
 from pathlib import Path
+import base64
 import os
 from django.core.exceptions import ImproperlyConfigured
 from dotenv import load_dotenv
@@ -275,6 +276,16 @@ WEBAUTHN_RP_NAME = os.environ.get("WEBAUTHN_RP_NAME", "Pecker Picker")
 WEBAUTHN_ORIGINS = os.environ.get("WEBAUTHN_ORIGINS", "https://triangulum.cc").split(",")
 # Run: keytool -list -v -keystore your-release.jks  to get this value
 ANDROID_SHA256_CERT_FINGERPRINT = os.environ.get("ANDROID_SHA256_CERT_FINGERPRINT", "PLACEHOLDER")
+
+
+def android_app_origin(fingerprint: str) -> str:
+    """The WebAuthn origin Android reports for a native app: its signing cert's SHA-256."""
+    cert_hash = bytes.fromhex(fingerprint.replace(":", ""))
+    return "android:apk-key-hash:" + base64.urlsafe_b64encode(cert_hash).decode().rstrip("=")
+
+
+if ANDROID_SHA256_CERT_FINGERPRINT not in ("", "PLACEHOLDER"):
+    WEBAUTHN_ORIGINS.append(android_app_origin(ANDROID_SHA256_CERT_FINGERPRINT))
 
 # ── Stripe ────────────────────────────────────────────────────────────────────
 STRIPE_SECRET_KEY      = os.environ.get("STRIPE_SECRET_KEY", "")

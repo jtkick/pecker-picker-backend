@@ -1129,3 +1129,13 @@ class LifelineTests(MessagingTestCase):
         res = self.start()
         self.as_user(self.bob)
         self.assertEqual(self.client.post(f"/api/lifelines/{res.data['id']}/end/").status_code, 404)
+
+
+class AndroidOriginTests(APITestCase):
+    def test_origin_is_base64url_of_signing_cert_hash(self):
+        from pecker_picker.settings import android_app_origin
+        fingerprint = ':'.join(f'{i:02X}' for i in range(32))
+        self.assertEqual(
+            android_app_origin(fingerprint),
+            'android:apk-key-hash:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8',
+        )
