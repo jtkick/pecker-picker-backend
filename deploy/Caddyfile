@@ -16,6 +16,7 @@ api.{$DOMAIN} {
 	}
 	handle {
 		root * /srv/site
+		try_files {path} {path}.html
 		file_server
 	}
 }
