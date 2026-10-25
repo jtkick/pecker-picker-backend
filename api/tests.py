@@ -999,6 +999,7 @@ class AuthThrottleTests(APITestCase):
     def setUp(self):
         cache.clear()
 
+    @override_settings(DEBUG=True)   # dev path: codes are logged, not texted
     def test_otp_send_is_limited_per_phone(self):
         codes = [
             self.client.post('/api/auth/otp/request/', {'phone_number': '+15550001111'}).status_code
@@ -1139,3 +1140,24 @@ class AndroidOriginTests(APITestCase):
             android_app_origin(fingerprint),
             'android:apk-key-hash:AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8',
         )
+
+
+class OtpSendFailureTests(APITestCase):
+    def setUp(self):
+        cache.clear()
+
+    def test_unconfigured_sms_in_production_is_an_error_not_code_sent(self):
+        r = self.client.post('/api/auth/otp/request/', {'phone_number': '+15550001111'})
+        self.assertEqual(r.status_code, 503)
+        self.assertFalse(OTPVerification.objects.exists())
+
+    @override_settings(TWILIO_ENABLED=True)
+    def test_twilio_refusal_is_reported(self):
+        from twilio.base.exceptions import TwilioRestException
+        with mock.patch('twilio.rest.Client') as client:
+            client.return_value.verify.v2.services.return_value.verifications.create.side_effect = (
+                TwilioRestException(400, 'https://verify.twilio.com', msg='Invalid parameter `To`', code=60200)
+            )
+            r = self.client.post('/api/auth/otp/request/', {'phone_number': '+1555'})
+        self.assertEqual(r.status_code, 503)
+        self.assertEqual(r.data['detail'], "We couldn't send a code to that number.")

@@ -43,7 +43,7 @@ from webauthn.helpers.structs import (
     AttestationConveyancePreference,
 )
 from .models import User, Persona, PersonaMember, PersonaPhoto, DiscoverEvent, ProfileImage, Album, AlbumGrant, Conversation, ConversationMember, DeviceToken, Message, MessageAttachment, MessageReaction, SavedPhrase, LocationShareGrant, Block, Report, FaceVerification, Kink, Interest, PasskeyCredential, WebAuthnChallenge, OTPVerification, Lifeline
-from .sms import send_otp_sms, send_verify_sms, check_verify_sms
+from .sms import SmsUnavailable, send_otp_sms, send_verify_sms, check_verify_sms
 from .serializers import (
     AccountSerializer, PersonaSummarySerializer, PersonaSerializer,
     GalleryImageSerializer, DiscoverPersonaSerializer, PersonaProfileSerializer,
@@ -298,16 +298,18 @@ def _generate_otp() -> str:
 
 
 def _create_and_send_otp(phone_number: str) -> None:
+    """Raises SmsUnavailable if no code went out."""
     if settings.TWILIO_ENABLED:
         send_verify_sms(phone_number)
         return
     code = _generate_otp()
-    OTPVerification.objects.create(
-        phone_number=phone_number,
-        code=code,
-        expires_at=timezone.now() + timedelta(minutes=settings.OTP_EXPIRY_MINUTES),
-    )
-    send_otp_sms(phone_number, code)
+    with transaction.atomic():
+        OTPVerification.objects.create(
+            phone_number=phone_number,
+            code=code,
+            expires_at=timezone.now() + timedelta(minutes=settings.OTP_EXPIRY_MINUTES),
+        )
+        send_otp_sms(phone_number, code)
 
 
 def _verify_otp_code(phone_number: str, code: str):
@@ -336,7 +338,10 @@ def otp_request(request):
     phone = (request.data.get('phone_number') or '').strip()
     if not phone:
         return Response({'detail': 'phone_number required.'}, status=status.HTTP_400_BAD_REQUEST)
-    _create_and_send_otp(phone)
+    try:
+        _create_and_send_otp(phone)
+    except SmsUnavailable as exc:
+        return Response({'detail': str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
     return Response({'detail': 'Code sent.'})
 
 
@@ -376,7 +381,10 @@ def link_phone_request(request):
         return Response({'detail': 'phone_number required.'}, status=status.HTTP_400_BAD_REQUEST)
     if User.objects.filter(phone_number=phone).exclude(pk=request.user.pk).exists():
         return Response({'detail': 'Phone number already in use.'}, status=status.HTTP_400_BAD_REQUEST)
-    _create_and_send_otp(phone)
+    try:
+        _create_and_send_otp(phone)
+    except SmsUnavailable as exc:
+        return Response({'detail': str(exc)}, status=status.HTTP_503_SERVICE_UNAVAILABLE)
     return Response({'detail': 'Code sent.'})
 
 
