@@ -12,8 +12,8 @@ docker compose -f docker-compose.prod.yml exec -T postgres \
     sh -c 'pg_dump -Fc -U "$POSTGRES_USER" "$POSTGRES_DB"' \
     | rclone rcat "r2:$bucket/pg/$stamp.dump"
 
-# The rclone remote sets no_head (R2 can't answer rclone's post-upload check),
-# so confirm the dump landed; an empty database still dumps to several KB.
+# Confirm the dump landed; an empty database still dumps to several KB.
+# Needs rclone ≥ 1.61: Ubuntu's 1.60 fails R2 uploads (install from rclone.org).
 size=$(rclone lsf --format s "r2:$bucket/pg/$stamp.dump")
 if [ "${size:-0}" -lt 1024 ]; then
     echo "Backup missing or too small in R2 (${size:-0} bytes)" >&2
