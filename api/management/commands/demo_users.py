@@ -228,13 +228,13 @@ class Command(BaseCommand):
             user.latitude, user.longitude = location
             user.location_updated_at = timezone.now()
             user.neighborhood = _neighborhood(*location) if None not in location else ''
+        user.age = e.get('age')
         user.pronouns = e.get('pronouns') or ''
         user.height, user.length = e.get('height'), e.get('length')
         user.save()
 
         persona = user.get_active_persona()
         persona.display_name = e['display_name']
-        persona.age = e.get('age')
         persona.bio = e.get('bio') or ''
         persona.relationship_types = e.get('looking_for') or []
         persona.intent = 1 if persona.relationship_types else 0
@@ -344,12 +344,12 @@ class Command(BaseCommand):
                 # Within ~30 km of the center.
                 latitude=lat + rng.uniform(-0.27, 0.27),
                 longitude=lng + rng.uniform(-0.35, 0.35),
+                age=rng.randint(18, 60),
                 pronouns=rng.choice(['', 'he/him', 'she/her', 'they/them']),
                 height=rng.choice([None, rng.randint(155, 200)]),
             )
             persona = user.get_active_persona()
             persona.display_name = f'{rng.choice(names)} {i}'
-            persona.age = rng.randint(18, 60)
             persona.relationship_types = rng.sample(list(FRESHNESS), rng.randint(0, 3))
             persona.intent = 1 if persona.relationship_types else 0
             persona.is_side = rng.random() < 0.1

@@ -105,6 +105,7 @@ class AccountSerializer(serializers.ModelSerializer):
         fields = [
             "notifications_enabled",
             "blur_explicit",
+            "age",
             "pronouns",
             "height",
             "length",
@@ -207,6 +208,7 @@ class DiscoverPersonaSerializer(serializers.ModelSerializer):
     longitude = serializers.SerializerMethodField()
     neighborhood = serializers.CharField(source='user.neighborhood', read_only=True)
     is_verified = serializers.SerializerMethodField()
+    age = serializers.SerializerMethodField()
     pronouns = serializers.SerializerMethodField()
     height = serializers.SerializerMethodField()
     position = serializers.SerializerMethodField()
@@ -300,6 +302,9 @@ class DiscoverPersonaSerializer(serializers.ModelSerializer):
 
     # Account-wide values, shown only where the persona opts in.
     # Groups show these per member instead (see get_members).
+    def get_age(self, obj):
+        return discover.shown_age(obj)
+
     def get_pronouns(self, obj):
         return obj.user.pronouns if obj.show_pronouns and not obj.group_type else ''
 

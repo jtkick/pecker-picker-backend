@@ -223,11 +223,17 @@ def effective_filters(persona, is_plus: bool) -> dict:
     return {k: v for k, v in filters.items() if k in allowed}
 
 
+def shown_age(persona):
+    """The account's age where the persona shows it; groups have none."""
+    return persona.user.age if persona.show_age and not persona.group_type else None
+
+
 def _passes(candidate, filters, now, verified: bool) -> bool:
     if not candidate.group_type:
-        if 'age_min' in filters and (candidate.age is None or candidate.age < filters['age_min']):
+        age = shown_age(candidate)
+        if 'age_min' in filters and (age is None or age < filters['age_min']):
             return False
-        if 'age_max' in filters and (candidate.age is None or candidate.age > filters['age_max']):
+        if 'age_max' in filters and (age is None or age > filters['age_max']):
             return False
     if filters.get('looking_for') and not set(filters['looking_for']) & set(candidate.relationship_types or ()):
         return False

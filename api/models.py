@@ -41,6 +41,7 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     # Shared by every persona; each persona decides whether to show them (Persona.show_*).
     pronouns = models.CharField(max_length=20, blank=True)
+    age = models.SmallIntegerField(null=True, blank=True)
     height = models.SmallIntegerField(null=True, blank=True)   # cm
     length = models.SmallIntegerField(null=True, blank=True)   # tenths of an inch, 0–120
 
@@ -158,7 +159,6 @@ class Persona(models.Model):
 
     display_name = models.CharField(max_length=50, blank=True)
     bio = models.TextField(max_length=300, blank=True)
-    age = models.SmallIntegerField(null=True, blank=True)
 
     # 0 = Browsing, 1 = Looking
     intent = models.SmallIntegerField(default=0)
@@ -177,7 +177,8 @@ class Persona(models.Model):
     is_side        = models.BooleanField(default=False)   # hides position; position is kept for switching back
     power_position = models.SmallIntegerField(null=True, blank=True, choices=POWER_POSITION_CHOICES)
 
-    # Whether this persona shows the account's pronouns / height / length.
+    # Whether this persona shows the account's age / pronouns / height / length.
+    show_age = models.BooleanField(default=True)
     show_pronouns = models.BooleanField(default=True)
     show_height = models.BooleanField(default=True)
     show_length = models.BooleanField(default=True)
@@ -190,9 +191,9 @@ class Persona(models.Model):
 
     # Fields copied by "duplicate"; everything a user edits on a profile.
     PROFILE_FIELDS = [
-        'display_name', 'bio', 'age', 'intent',
+        'display_name', 'bio', 'intent',
         'looking_for_chat', 'looking_for_cuddle', 'looking_for_fool_around', 'looking_for_sex',
-        'location_sharing', 'position', 'is_side', 'power_position', 'show_pronouns', 'show_height', 'show_length',
+        'location_sharing', 'position', 'is_side', 'power_position', 'show_age', 'show_pronouns', 'show_height', 'show_length',
         'kinks', 'interests', 'relationship_types', 'can_host', 'can_travel', 'discover_filters',
     ]
 
