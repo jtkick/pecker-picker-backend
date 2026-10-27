@@ -172,6 +172,9 @@ USE_TZ = True
 STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 
+# Area lookup file built by deploy/build_areas.py; without it, neighbourhoods come from Nominatim.
+AREAS_DB = os.environ.get("AREAS_DB", str(BASE_DIR / "data" / "areas.sqlite3"))
+
 MAX_UPLOAD_SIZE_MB = 10
 MAX_GALLERY_IMAGES = 6   # public photos per persona
 MAX_SAVED_PHRASES = 30

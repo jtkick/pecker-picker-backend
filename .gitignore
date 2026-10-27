@@ -9,4 +9,5 @@ dist/
 build/
 .DS_Store
 secrets/
+data/
 deploy/ops.env

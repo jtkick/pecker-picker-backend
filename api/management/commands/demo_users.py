@@ -65,6 +65,7 @@ from django.utils import timezone
 from PIL import Image, UnidentifiedImageError
 
 from api.discover import FRESHNESS
+from api import areas
 from api.geocoding import reverse_geocode
 from api.media import strip_image_metadata
 from api.models import Interest, Kink, Persona, PersonaPhoto, ProfileImage, User
@@ -81,6 +82,14 @@ def _neighborhood(lat: float, lng: float) -> str:
     time.sleep(max(0.0, _last_geocode + GEOCODE_INTERVAL - time.monotonic()))
     _last_geocode = time.monotonic()
     return reverse_geocode(lat, lng)
+
+def _place(user):
+    """Areas and neighbourhood label for the user's stored location."""
+    if areas.available():
+        areas.assign(user)
+    else:
+        user.neighborhood = _neighborhood(user.latitude, user.longitude) if user.latitude is not None else ''
+
 
 POSITIONS = {'bottom': 0, 'vers_bottom': 1, 'vers': 2, 'vers_top': 3, 'top': 4}
 POWERS = {'sub': 0, 'sub_switch': 1, 'switch': 2, 'dom_switch': 3, 'dom': 4}
@@ -227,7 +236,7 @@ class Command(BaseCommand):
         if location != (user.latitude, user.longitude):
             user.latitude, user.longitude = location
             user.location_updated_at = timezone.now()
-            user.neighborhood = _neighborhood(*location) if None not in location else ''
+            _place(user)
         user.age = e.get('age')
         user.pronouns = e.get('pronouns') or ''
         user.height, user.length = e.get('height'), e.get('length')
@@ -348,6 +357,9 @@ class Command(BaseCommand):
                 pronouns=rng.choice(['', 'he/him', 'she/her', 'they/them']),
                 height=rng.choice([None, rng.randint(155, 200)]),
             )
+            if areas.available():
+                areas.assign(user)
+                user.save(update_fields=areas.AREA_FIELDS)
             persona = user.get_active_persona()
             persona.display_name = f'{rng.choice(names)} {i}'
             persona.relationship_types = rng.sample(list(FRESHNESS), rng.randint(0, 3))

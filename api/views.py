@@ -50,7 +50,7 @@ from .serializers import (
     AlbumSerializer, AlbumGrantSerializer, LocationShareGrantSerializer, ConversationSerializer, MessageSerializer,
     GroupMemberSerializer, InvitationSerializer, LifelineSerializer, persona_verified,
 )
-from . import discover
+from . import areas, discover, geo
 from .membership import (
     ACCEPTED, group_locked, in_use, in_use_q, is_editor, membership, owner_plus_q, persona_user_ids, personas_for,
 )
@@ -545,7 +545,10 @@ def me(request):
     if 'latitude' in request.data or 'longitude' in request.data:
         user = request.user
         User.objects.filter(pk=user.pk).update(location_updated_at=timezone.now())
-        if user.latitude is not None and user.longitude is not None:
+        if user.latitude is not None and user.longitude is not None and areas.available():
+            areas.assign(user)
+            user.save(update_fields=areas.AREA_FIELDS)
+        elif user.latitude is not None and user.longitude is not None:
             lat, lng, pk = user.latitude, user.longitude, user.pk
             threading.Thread(
                 target=lambda: User.objects.filter(pk=pk).update(
@@ -1219,7 +1222,16 @@ def discover_feed(request):
 @api_view(["GET"])
 @throttle_classes([DiscoverThrottle])
 def discover_map(request):
-    """Best-ranked pins inside `bbox=min_lat,min_lng,max_lat,max_lng`, at the positions viewers may see."""
+    """
+    Best-ranked pins inside `bbox=min_lat,min_lng,max_lat,max_lng`, at the positions viewers may see.
+    With `group=neighbourhood|locality|county`, General-location profiles come grouped under
+    that area (or the nearest coarser one they have) instead of at fuzzed positions:
+    {"pins": [...], "areas": [{id, kind, name, latitude, longitude, profiles: [...]}]}.
+    """
+    group = request.query_params.get('group')
+    if group is not None and group not in areas.KINDS:
+        return Response({'error': f'group must be one of {", ".join(areas.KINDS)}.'},
+                        status=status.HTTP_400_BAD_REQUEST)
     try:
         bbox = [float(v) for v in request.query_params['bbox'].split(',')]
         if len(bbox) != 4 or bbox[0] >= bbox[2] or bbox[1] >= bbox[3]:
@@ -1234,7 +1246,30 @@ def discover_map(request):
     # Off-location personas have no map position to show.
     pins = [r for r in ranked if r.level >= 1][:discover.MAP_PIN_LIMIT]
     ctx = {'request': request, 'ranked': {r.persona.pk: r for r in pins}}
-    return Response(DiscoverPersonaSerializer([r.persona for r in pins], many=True, context=ctx).data)
+    if group is None:
+        return Response(DiscoverPersonaSerializer([r.persona for r in pins], many=True, context=ctx).data)
+
+    loose, grouped = [], {}   # grouped: Area → personas, best-ranked area first
+    use_areas = areas.available()
+    for r in pins:
+        area = areas.area_for(geo.located_user(r.persona), group) if use_areas and r.level == 1 else None
+        if area is None:
+            loose.append(r.persona)
+        else:
+            grouped.setdefault(area, []).append(r.persona)
+
+    def serialize(personas):
+        return DiscoverPersonaSerializer(personas, many=True, context=ctx).data
+
+    out_areas = []
+    for area, members in grouped.items():
+        profiles = serialize(members)
+        for p in profiles:
+            # The area stands in for where they are.
+            p['latitude'] = p['longitude'] = None
+        out_areas.append({'id': area.id, 'kind': area.kind, 'name': area.name,
+                          'latitude': area.lat, 'longitude': area.lng, 'profiles': profiles})
+    return Response({'pins': serialize(loose), 'areas': out_areas})
 
 
 @api_view(["GET"])

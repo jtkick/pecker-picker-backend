@@ -57,6 +57,8 @@ services:
     volumes:
       # The old SQLite DB, kept as a fallback (used only when POSTGRES_DB is unset).
       - ./db.sqlite3:/app/db.sqlite3
+      # Area lookup file (deploy/build_areas.py).
+      - ./data:/app/data:ro
     depends_on:
       postgres:
         condition: service_healthy

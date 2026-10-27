@@ -1257,3 +1257,110 @@ class AccountDeletionTests(PersonaTestCase):
         with mock.patch('stripe.Subscription.cancel') as cancel:
             self.assertEqual(self.delete_alice().status_code, 204)
         cancel.assert_called_once_with('sub_1')
+
+
+def _square(s, w, n, e):
+    return {'type': 'Polygon', 'coordinates': [[[w, s], [e, s], [e, n], [w, n], [w, s]]]}
+
+
+def build_test_areas(dest: str):
+    """A tiny Who's On First source around Cincinnati, run through deploy/build_areas.py."""
+    import importlib.util
+    import sqlite3
+    places = [
+        # id, placetype, name, geometry, km², extra properties
+        (1, 'region', 'Ohio', {'type': 'Point', 'coordinates': [-82.9, 40.4]}, 0, {'wof:shortcode': 'OH'}),
+        (10, 'county', 'Hamilton', _square(38.9, -84.8, 39.3, -84.2), 1500, {'wof:placetype_local': 'county'}),
+        (20, 'locality', 'Cincinnati', _square(39.05, -84.6, 39.2, -84.4), 300, {}),
+        (30, 'neighbourhood', 'Over-the-Rhine', _square(39.09, -84.51, 39.11, -84.49), 3.8, {}),
+        (31, 'neighbourhood', 'Clifton', {'type': 'Point', 'coordinates': [-84.52, 39.15]}, 0,
+         {'wof:population': 100}),
+        # Within 1 km of Clifton, so thinned away.
+        (33, 'neighbourhood', 'Clifton Heights', {'type': 'Point', 'coordinates': [-84.52, 39.153]}, 0, {}),
+        # Under 1 km², so kept only as a point.
+        (32, 'neighbourhood', 'Tiny', _square(39.16, -84.45, 39.165, -84.445), 0.3, {}),
+    ]
+    src = str(Path(dest).with_name('wof.db'))
+    db = sqlite3.connect(src)
+    db.execute('CREATE TABLE spr (id INTEGER PRIMARY KEY, placetype TEXT, latitude REAL, longitude REAL, '
+               'is_current INTEGER, is_deprecated INTEGER, is_superseded INTEGER, is_ceased INTEGER, country TEXT)')
+    db.execute('CREATE TABLE geojson (id INTEGER, body TEXT, is_alt INTEGER)')
+    for wid, placetype, name, geometry, km2, extra in places:
+        ring = geometry['coordinates'][0] if geometry['type'] == 'Polygon' else [geometry['coordinates']]
+        lat = sum(p[1] for p in ring) / len(ring)
+        lng = sum(p[0] for p in ring) / len(ring)
+        hierarchy = {'region_id': 1, 'county_id': 10, 'locality_id': 20}
+        props = {'wof:id': wid, 'wof:name': name, 'wof:hierarchy': [hierarchy], 'geom:area_square_m': km2 * 1e6,
+                 'lbl:latitude': lat, 'lbl:longitude': lng, **extra}
+        db.execute('INSERT INTO spr VALUES (?,?,?,?,1,0,0,0,?)', (wid, placetype, lat, lng, 'US'))
+        db.execute('INSERT INTO geojson VALUES (?,?,0)',
+                   (wid, json.dumps({'type': 'Feature', 'properties': props, 'geometry': geometry})))
+    db.commit()
+    db.close()
+    spec = importlib.util.spec_from_file_location(
+        'build_areas', Path(__file__).resolve().parents[1] / 'deploy' / 'build_areas.py')
+    builder = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(builder)
+    with mock.patch('builtins.print'):
+        builder.main(src, dest)
+
+
+class AreaTests(PersonaTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        cls.dir = tempfile.mkdtemp()
+        cls.areas_db = str(Path(cls.dir) / 'areas.sqlite3')
+        build_test_areas(cls.areas_db)
+        cls.settings = override_settings(AREAS_DB=cls.areas_db)
+        cls.settings.enable()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.settings.disable()
+        super().tearDownClass()
+
+    def test_neighbourhood_shape_then_locality_then_county(self):
+        from . import areas
+        self.assertEqual(areas.place(39.1, -84.5).label, 'Over-the-Rhine, Cincinnati')
+        self.assertEqual(areas.place(39.06, -84.58).label, 'Cincinnati, OH')
+        self.assertEqual(areas.place(38.95, -84.3).label, 'Hamilton County, OH')
+        self.assertEqual(areas.place(45.0, -100.0).label, '')
+
+    def test_nearest_point_neighbourhood_after_thinning(self):
+        from . import areas
+        self.assertEqual(areas.place(39.152, -84.52).neighbourhood.name, 'Clifton')
+        self.assertIsNone(areas.get(33))                                   # within 1 km of Clifton
+        self.assertEqual(areas.get(32).name, 'Tiny')                       # under 1 km²: a point
+        self.assertIsNone(areas.place(39.06, -84.58).neighbourhood)        # no point within 2 km
+
+    def test_location_update_places_the_account(self):
+        self.as_user(self.bob)
+        self.client.patch('/api/me/', {'latitude': 39.1, 'longitude': -84.5}, format='json')
+        self.bob.refresh_from_db()
+        self.assertEqual((self.bob.area_neighbourhood, self.bob.area_locality, self.bob.area_county), (30, 20, 10))
+        self.assertEqual(self.bob.neighborhood, 'Over-the-Rhine, Cincinnati')
+
+    def test_map_groups_general_profiles_by_area(self):
+        cache.clear()
+        carol, carol_main = make_user('+15550100103', 'Carol', lat=39.152, lng=-84.52)
+        dave, dave_main = make_user('+15550100104', 'Dave')
+        for persona, sharing in ((self.bob_main, 1), (carol_main, 1), (dave_main, 2)):
+            persona.location_sharing = sharing
+            persona.last_active_at = timezone.now()
+            persona.save()
+        call_command('assign_areas', stdout=io.StringIO())
+        self.as_user(self.alice)
+        bbox = '39.0,-84.6,39.2,-84.4'
+
+        res = self.client.get('/api/discover/map/', {'bbox': bbox, 'group': 'neighbourhood'}).data
+        self.assertEqual([p['id'] for p in res['pins']], [dave_main.pk])
+        groups = {a['name']: [p['id'] for p in a['profiles']] for a in res['areas']}
+        self.assertEqual(groups, {'Over-the-Rhine': [self.bob_main.pk], 'Clifton': [carol_main.pk]})
+        self.assertIsNone(res['areas'][0]['profiles'][0]['latitude'])
+
+        res = self.client.get('/api/discover/map/', {'bbox': bbox, 'group': 'locality'}).data
+        self.assertEqual([(a['name'], len(a['profiles'])) for a in res['areas']], [('Cincinnati', 2)])
+        self.assertEqual(self.client.get('/api/discover/map/', {'bbox': bbox, 'group': 'city'}).status_code, 400)
+        # Without `group`, older apps still get a plain list.
+        self.assertIsInstance(self.client.get('/api/discover/map/', {'bbox': bbox}).data, list)

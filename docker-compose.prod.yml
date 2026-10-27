@@ -71,6 +71,8 @@ services:
       # Firebase service-account JSON; point FIREBASE_CREDENTIALS_FILE at
       # /run/secrets/<file> in .env.
       - ./secrets:/run/secrets:ro
+      # Area lookup file (deploy/build_areas.py).
+      - ./data:/app/data:ro
     healthcheck:
       # Host header must be an ALLOWED_HOSTS entry.
       test: ["CMD-SHELL", "python -c \"import os, urllib.request as u; u.urlopen(u.Request('http://localhost:3425/api/health/', headers={'Host': 'api.' + os.environ['DOMAIN']}), timeout=5)\""]

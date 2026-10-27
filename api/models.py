@@ -54,6 +54,10 @@ class User(AbstractBaseUser, PermissionsMixin):
     longitude = models.FloatField(null=True, blank=True, db_index=True)
     location_updated_at = models.DateTimeField(null=True, blank=True)
     neighborhood = models.CharField(max_length=100, blank=True)
+    # Named areas around the stored location (Who's On First ids; see api.areas).
+    area_neighbourhood = models.BigIntegerField(null=True, blank=True)
+    area_locality = models.BigIntegerField(null=True, blank=True)
+    area_county = models.BigIntegerField(null=True, blank=True)
 
     # ── Subscription ──────────────────────────────────────────────────────────
     # 0 = Free, 1 = Plus  (extend by adding new integer constants)
