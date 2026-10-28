@@ -145,7 +145,6 @@ class Persona(models.Model):
     """
     GROUP_COUPLE, GROUP_THROUPLE, GROUP_GROUP = 'couple', 'throuple', 'group'
     GROUP_TYPE_CHOICES = [('', 'Solo'), (GROUP_COUPLE, 'Couple'), (GROUP_THROUPLE, 'Throuple'), (GROUP_GROUP, 'Group')]
-    GROUP_CAPS = {GROUP_COUPLE: 2, GROUP_THROUPLE: 3, GROUP_GROUP: 10}
 
     user = models.ForeignKey(User, on_delete=models.CASCADE, related_name='personas')
     group_type = models.CharField(max_length=10, choices=GROUP_TYPE_CHOICES, blank=True, default='')

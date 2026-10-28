@@ -693,7 +693,7 @@ def personas(request):
         )
 
     group_type = request.data.get('group_type') or ''
-    if group_type not in Persona.GROUP_CAPS and group_type != '':
+    if group_type not in dict(Persona.GROUP_TYPE_CHOICES):
         return Response({'error': 'Unknown group_type.'}, status=status.HTTP_400_BAD_REQUEST)
     if group_type and not user.has_tier(User.TIER_PLUS):
         return Response(
@@ -873,10 +873,6 @@ def persona_members(request, pk):
             PersonaMember.STATUS_DECLINED: 'They declined this invitation.',
         }[existing.status]
         return Response({'error': message}, status=status.HTTP_400_BAD_REQUEST)
-    cap = Persona.GROUP_CAPS[persona.group_type]
-    if PersonaMember.objects.filter(persona=persona).exclude(status=PersonaMember.STATUS_DECLINED).count() >= cap:
-        return Response({'error': f'A {persona.get_group_type_display().lower()} has at most {cap} people.'},
-                        status=status.HTTP_400_BAD_REQUEST)
     member = PersonaMember.objects.create(
         persona=persona, user=invitee, invited_by=request.user,
         invited_via=request.user.get_active_persona(), invited_as=target,

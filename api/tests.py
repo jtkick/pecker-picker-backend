@@ -292,9 +292,9 @@ class GroupPersonaTests(PersonaTestCase):
         self.assertFalse(self.group.photos.exists())
         self.assertEqual(self.listing(self.alice)[self.group.pk]['member_count'], 1)
 
-    def test_cap_and_no_reinvite_after_decline(self):
+    def test_no_size_cap_and_no_reinvite_after_decline(self):
         self.assertEqual(self.invite(self.bob_main).status_code, 201)
-        self.assertEqual(self.invite(self.carol_main).status_code, 400)   # a couple is two people
+        self.assertEqual(self.invite(self.carol_main).status_code, 201)   # group size isn't fixed by its type
         self.as_user(self.bob)
         invitation = self.client.get('/api/invitations/').data[0]
         self.assertEqual(invitation['group']['display_name'], 'A+B')
