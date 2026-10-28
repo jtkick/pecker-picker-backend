@@ -311,11 +311,13 @@ class Ranked:
 
 
 def rank(qs, viewer_user, viewer_persona, *, sort='recommended', filters=None, radius_km=None,
-         bbox=None, now=None, verified=lambda persona: False) -> list[Ranked]:
+         bbox=None, now=None, verified=lambda persona: False, shown_at=None) -> list[Ranked]:
     """
     Visible personas from `qs` (already excluding hidden ones), best first.
     The viewer's stored location is the center; `bbox` (min_lat, min_lng, max_lat, max_lng)
     restricts to an area instead of a radius. `verified(persona)` decides the verified signal.
+    `shown_at(persona, level)` is where the map will draw a persona, if not at its position;
+    `bbox` is tested against that.
     """
     now = now or timezone.now()
     filters = filters or {}
@@ -346,8 +348,9 @@ def rank(qs, viewer_user, viewer_persona, *, sort='recommended', filters=None, r
             continue
         level = max(persona.location_sharing, grants.get(persona.pk, 0))
         where = geo.position(persona, level)
-        if bbox is not None and (where is None or not (
-            bbox[0] <= where[0] <= bbox[2] and bbox[1] <= where[1] <= bbox[3]
+        shown = (shown_at and shown_at(persona, level)) or where
+        if bbox is not None and (shown is None or not (
+            bbox[0] <= shown[0] <= bbox[2] and bbox[1] <= shown[1] <= bbox[3]
         )):
             continue
         km = geo.haversine_km(origin, where) if has_origin and where is not None else None

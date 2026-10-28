@@ -1242,7 +1242,19 @@ def discover_map(request):
     user = request.user
     me = user.get_active_persona()
     filters = discover.effective_filters(me, user.has_tier(User.TIER_PLUS))
-    ranked = discover.rank(_discoverable_qs(user), user, me, filters=filters, bbox=bbox, verified=persona_verified)
+    use_areas = group is not None and areas.available()
+
+    def area_of(persona, level):
+        """The area a General-location persona is drawn under, if any."""
+        return areas.area_for(geo.located_user(persona), group) if use_areas and level == 1 else None
+
+    def shown_at(persona, level):
+        # Grouped people stay while their area is on screen, wherever their fuzzed position falls.
+        area = area_of(persona, level)
+        return (area.lat, area.lng) if area else None
+
+    ranked = discover.rank(_discoverable_qs(user), user, me, filters=filters, bbox=bbox,
+                           verified=persona_verified, shown_at=shown_at)
     # Off-location personas have no map position to show.
     pins = [r for r in ranked if r.level >= 1][:discover.MAP_PIN_LIMIT]
     ctx = {'request': request, 'ranked': {r.persona.pk: r for r in pins}}
@@ -1250,9 +1262,8 @@ def discover_map(request):
         return Response(DiscoverPersonaSerializer([r.persona for r in pins], many=True, context=ctx).data)
 
     loose, grouped = [], {}   # grouped: Area → personas, best-ranked area first
-    use_areas = areas.available()
     for r in pins:
-        area = areas.area_for(geo.located_user(r.persona), group) if use_areas and r.level == 1 else None
+        area = area_of(r.persona, r.level)
         if area is None:
             loose.append(r.persona)
         else:

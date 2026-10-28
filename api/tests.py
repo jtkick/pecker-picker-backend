@@ -1359,6 +1359,13 @@ class AreaTests(PersonaTestCase):
         self.assertEqual(groups, {'Over-the-Rhine': [self.bob_main.pk], 'Clifton': [carol_main.pk]})
         self.assertIsNone(res['areas'][0]['profiles'][0]['latitude'])
 
+        # Zoomed right in on a label, its people stay wherever their fuzzed positions fall.
+        otr = next(a for a in res['areas'] if a['name'] == 'Over-the-Rhine')
+        lat, lng = otr['latitude'], otr['longitude']
+        tiny = f'{lat - 0.001},{lng - 0.001},{lat + 0.001},{lng + 0.001}'
+        zoomed = self.client.get('/api/discover/map/', {'bbox': tiny, 'group': 'neighbourhood'}).data
+        self.assertEqual([[p['id'] for p in a['profiles']] for a in zoomed['areas']], [[self.bob_main.pk]])
+
         res = self.client.get('/api/discover/map/', {'bbox': bbox, 'group': 'locality'}).data
         self.assertEqual([(a['name'], len(a['profiles'])) for a in res['areas']], [('Cincinnati', 2)])
         self.assertEqual(self.client.get('/api/discover/map/', {'bbox': bbox, 'group': 'city'}).status_code, 400)
