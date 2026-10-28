@@ -2,7 +2,7 @@ import phonenumbers
 from django.db.models import Q
 from django.utils import timezone
 from rest_framework import serializers
-from .models import User, Persona, PersonaMember, ProfileImage, Album, AlbumGrant, Conversation, Message, LocationShareGrant, FaceVerification, Lifeline
+from .models import User, Persona, PersonaMember, ProfileImage, Album, AlbumGrant, Conversation, Message, LocationShareGrant, FaceVerification, Lifeline, Friend
 from . import discover
 from .geo import fuzz_coords
 from .membership import in_use
@@ -336,9 +336,14 @@ class PersonaProfileSerializer(DiscoverPersonaSerializer):
     Context: `viewer_persona` (the viewer's active persona).
     """
     effective_location_sharing = serializers.SerializerMethodField()
+    is_friend = serializers.SerializerMethodField()
 
     class Meta(DiscoverPersonaSerializer.Meta):
-        fields = DiscoverPersonaSerializer.Meta.fields + ['effective_location_sharing']
+        fields = DiscoverPersonaSerializer.Meta.fields + ['effective_location_sharing', 'is_friend']
+
+    def get_is_friend(self, obj):
+        viewer = self.context.get('viewer_persona')
+        return viewer is not None and Friend.objects.filter(persona=viewer, friend=obj).exists()
 
     def get_gallery_images(self, obj):
         images = _public_images(obj) + _granted_images(obj, self.context.get('viewer_persona'))

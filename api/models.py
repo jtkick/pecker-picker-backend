@@ -219,6 +219,26 @@ class DiscoverEvent(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
 
 
+class Friend(models.Model):
+    """A persona friending another. One-way: the friended persona isn't asked or told."""
+    persona = models.ForeignKey('Persona', on_delete=models.CASCADE, related_name='friends_added')
+    friend = models.ForeignKey('Persona', on_delete=models.CASCADE, related_name='+')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = [('persona', 'friend')]
+
+
+class ProfileView(models.Model):
+    """The latest time `viewer` opened `viewed`'s profile."""
+    viewer = models.ForeignKey('Persona', on_delete=models.CASCADE, related_name='+')
+    viewed = models.ForeignKey('Persona', on_delete=models.CASCADE, related_name='profile_views')
+    viewed_at = models.DateTimeField(default=timezone.now, db_index=True)
+
+    class Meta:
+        unique_together = [('viewer', 'viewed')]
+
+
 class PersonaMember(models.Model):
     """
     An account in a group persona. The owner has a row too. Only the owner sets

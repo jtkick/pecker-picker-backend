@@ -23,7 +23,7 @@ from rest_framework.throttling import AnonRateThrottle, SimpleRateThrottle, User
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.core.cache import cache
 from django.db import IntegrityError, connection, transaction
-from django.db.models import Case, Count, F, OuterRef, Prefetch, Q, Subquery, When
+from django.db.models import Case, Count, F, Max, OuterRef, Prefetch, Q, Subquery, When
 from django.db.models.functions import Coalesce
 
 from rest_framework_simplejwt.exceptions import TokenError
@@ -42,7 +42,7 @@ from webauthn.helpers.structs import (
     UserVerificationRequirement,
     AttestationConveyancePreference,
 )
-from .models import User, Persona, PersonaMember, PersonaPhoto, DiscoverEvent, ProfileImage, Album, AlbumGrant, Conversation, ConversationMember, DeviceToken, Message, MessageAttachment, MessageReaction, SavedPhrase, LocationShareGrant, Block, Report, FaceVerification, Kink, Interest, PasskeyCredential, WebAuthnChallenge, OTPVerification, Lifeline
+from .models import User, Persona, PersonaMember, PersonaPhoto, DiscoverEvent, Friend, ProfileView, ProfileImage, Album, AlbumGrant, Conversation, ConversationMember, DeviceToken, Message, MessageAttachment, MessageReaction, SavedPhrase, LocationShareGrant, Block, Report, FaceVerification, Kink, Interest, PasskeyCredential, WebAuthnChallenge, OTPVerification, Lifeline
 from .sms import SmsUnavailable, send_otp_sms, send_verify_sms, check_verify_sms
 from .serializers import (
     AccountSerializer, PersonaSummarySerializer, PersonaSerializer,
@@ -1345,8 +1345,71 @@ def profile_detail(request, pk):
     if persona is None:
         return Response({'error': 'User not found.'}, status=status.HTTP_404_NOT_FOUND)
     _log_discover_event(request, me, persona, DiscoverEvent.KIND_OPENED)
+    if me is not None:
+        ProfileView.objects.update_or_create(viewer=me, viewed=persona, defaults={'viewed_at': timezone.now()})
     ctx = {'request': request, 'viewer_persona': me}
     return Response(PersonaProfileSerializer(persona, context=ctx).data)
+
+
+@api_view(["POST", "DELETE"])
+def profile_friend(request, pk):
+    """Friend (or unfriend) a profile as the active persona."""
+    me = request.user.get_active_persona()
+    if request.method == "DELETE":
+        Friend.objects.filter(persona=me, friend_id=pk).delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+    target = _visible_persona(request, pk)
+    if target is None:
+        return Response({'error': 'User not found.'}, status=status.HTTP_404_NOT_FOUND)
+    Friend.objects.get_or_create(persona=me, friend=target)
+    return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+# How far back "who viewed you" looks.
+PROFILE_VIEW_WINDOW = timedelta(days=7)
+
+
+def _connected_ids(me):
+    """Personas `me` has a two-way 1:1 chat with, mapped to when that chat last changed."""
+    spoken = Message.objects.filter(deleted_at__isnull=True).exclude(kind='system')
+    one_to_one = Conversation.objects.annotate(n=Count('members')).filter(n=2).values('pk')
+    mine = spoken.filter(sender=me, conversation__in=one_to_one).values('conversation')
+    replies = spoken.filter(conversation__in=mine).exclude(sender=me)
+    return dict(replies.order_by().values_list('sender').annotate(at=Max('conversation__updated_at')))
+
+
+def _connection_entries(request, me, stamps, serialize=True):
+    """
+    The personas in `stamps` (id → when) the caller may see and open, newest first.
+    As with profile_detail, a persona nobody's using is listed only if it already chats with `me`.
+    """
+    chatting = ConversationMember.objects.filter(conversation__members__persona=me).values('persona_id')
+    personas = sorted(
+        _persona_qs().filter(pk__in=stamps, user__is_active=True)
+        .exclude(_hidden_persona_q(request.user))
+        .filter(in_use_q() | Q(pk__in=chatting)),
+        key=lambda p: stamps[p.pk], reverse=True,
+    )
+    if not serialize:
+        return personas
+    data = DiscoverPersonaSerializer(personas, many=True, context={'request': request}).data
+    return [{**d, 'at': stamps[p.pk].isoformat()} for p, d in zip(personas, data)]
+
+
+@api_view(["GET"])
+def connections(request):
+    """The active persona's recent viewers (listed for Plus only; others get the count), friends, and connections."""
+    me = request.user.get_active_persona()
+    since = timezone.now() - PROFILE_VIEW_WINDOW
+    views = dict(ProfileView.objects.filter(viewed=me, viewed_at__gte=since).values_list('viewer_id', 'viewed_at'))
+    is_plus = request.user.has_tier(User.TIER_PLUS)
+    viewers = _connection_entries(request, me, views, serialize=is_plus)
+    return Response({
+        'viewers': viewers if is_plus else None,
+        'viewer_count': len(viewers),
+        'friends': _connection_entries(request, me, dict(me.friends_added.values_list('friend_id', 'created_at'))),
+        'connected': _connection_entries(request, me, _connected_ids(me)),
+    })
 
 
 @api_view(["GET", "POST"])

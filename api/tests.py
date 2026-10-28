@@ -27,7 +27,7 @@ from . import discover, geo, lifeline
 from .media import presigned_url, strip_image_metadata
 from .models import (
     Album, AlbumGrant, Block, Conversation, ConversationMember, DeviceToken, DiscoverEvent, Lifeline, LocationShareGrant,
-    Message, MessageAttachment, OTPVerification, Persona, PersonaMember, PersonaPhoto, ProfileImage, Report, User,
+    Message, MessageAttachment, OTPVerification, Persona, PersonaMember, PersonaPhoto, ProfileImage, ProfileView, Report, User,
     WebAuthnChallenge,
 )
 from .views import DiscoverThrottle
@@ -862,6 +862,57 @@ class MessageInteractionTests(MessagingTestCase):
         bob_alt = Persona.objects.create(user=self.bob, display_name='Bob Alt')
         User.objects.filter(pk=self.bob.pk).update(active_persona=bob_alt)
         self.assertIsNone(bob()['last_active_at'])
+
+class ConnectionsTests(MessagingTestCase):
+    def connections(self, user):
+        self.as_user(user)
+        return self.client.get('/api/connections/').data
+
+    def test_connected_needs_both_sides_to_speak(self):
+        self.send(self.alice)
+        self.assertEqual(self.connections(self.alice)['connected'], [])
+        self.send(self.bob)
+        self.assertEqual([p['id'] for p in self.connections(self.alice)['connected']], [self.bob_main.pk])
+        self.assertEqual([p['id'] for p in self.connections(self.bob)['connected']], [self.alice_main.pk])
+
+    def test_group_chat_is_not_a_connection(self):
+        carol, carol_main = make_user('+15550100103', 'Carol')
+        self.conv.participants.add(carol_main)
+        self.send(self.alice)
+        self.send(self.bob)
+        self.assertEqual(self.connections(self.alice)['connected'], [])
+
+    def test_friend_is_one_way(self):
+        self.as_user(self.alice)
+        self.assertEqual(self.client.post(f'/api/profiles/{self.bob_main.pk}/friend/').status_code, 204)
+        self.assertTrue(self.client.get(f'/api/profiles/{self.bob_main.pk}/').data['is_friend'])
+        self.assertEqual([p['id'] for p in self.connections(self.alice)['friends']], [self.bob_main.pk])
+        self.assertEqual(self.connections(self.bob)['friends'], [])
+        self.as_user(self.alice)
+        self.client.delete(f'/api/profiles/{self.bob_main.pk}/friend/')
+        self.assertEqual(self.connections(self.alice)['friends'], [])
+
+    def test_viewers_listed_for_plus_only(self):
+        self.as_user(self.alice)
+        self.client.get(f'/api/profiles/{self.bob_main.pk}/')
+        free = self.connections(self.bob)
+        self.assertIsNone(free['viewers'])
+        self.assertEqual(free['viewer_count'], 1)
+        self.bob.subscription_tier = User.TIER_PLUS
+        self.bob.save()
+        self.assertEqual([p['id'] for p in self.connections(self.bob)['viewers']], [self.alice_main.pk])
+
+    def test_old_views_and_blocked_viewers_drop_off(self):
+        self.bob.subscription_tier = User.TIER_PLUS
+        self.bob.save()
+        self.as_user(self.alice)
+        self.client.get(f'/api/profiles/{self.bob_main.pk}/')
+        Block.objects.create(blocker=self.bob, blocked=self.alice, blocked_persona=self.alice_main)
+        self.assertEqual(self.connections(self.bob)['viewer_count'], 0)
+        Block.objects.all().delete()
+        ProfileView.objects.update(viewed_at=timezone.now() - timedelta(days=8))
+        self.assertEqual(self.connections(self.bob)['viewers'], [])
+
 
 def jpeg(name='p.jpg', with_exif=True):
     exif = Image.Exif()
