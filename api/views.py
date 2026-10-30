@@ -48,7 +48,7 @@ from .serializers import (
     AccountSerializer, PersonaSummarySerializer, PersonaSerializer,
     GalleryImageSerializer, DiscoverPersonaSerializer, PersonaProfileSerializer,
     AlbumSerializer, AlbumGrantSerializer, LocationShareGrantSerializer, ConversationSerializer, MessageSerializer,
-    GroupMemberSerializer, InvitationSerializer, LifelineSerializer, persona_verified,
+    GroupMemberSerializer, InvitationSerializer, LifelineSerializer, persona_verified, _share_active,
 )
 from . import areas, discover, geo
 from .membership import (
@@ -556,6 +556,14 @@ def me(request):
                 ),
                 daemon=True,
             ).start()
+        # Live location messages follow me as I move.
+        now = timezone.now()
+        live = list(LocationShareGrant.objects.filter(
+            Q(grantor__user=user) | Q(grantor__last_active_user=user),
+        ).filter(Q(expires_at__isnull=True) | Q(expires_at__gt=now)).values_list('pk', flat=True))
+        _refresh_share_messages(Message.KIND_LIVE_LOCATION, live)
+        # Tells the app to keep updating in the background while anyone can see me.
+        return Response({**serializer.data, 'sharing_location': bool(live)})
     return Response(serializer.data)
 
 
@@ -1120,6 +1128,9 @@ def album_grants(request):
             qs = qs.filter(grantee_id=grantee_id)
         return Response(AlbumGrantSerializer(qs, many=True).data)
 
+    locked = _locked_group_response(me)
+    if locked:
+        return locked
     try:
         album = request.user.albums.get(pk=request.data.get('album_id'))
     except (Album.DoesNotExist, TypeError, ValueError):
@@ -1129,11 +1140,25 @@ def album_grants(request):
         return Response({'error': 'User not found.'}, status=status.HTTP_404_NOT_FOUND)
 
     expires_at = request.data.get('expires_at')
+    if expires_at is not None:
+        expires_at = parse_datetime(str(expires_at))
+        if expires_at is None:
+            return Response({'error': 'expires_at must be an ISO datetime or null.'}, status=status.HTTP_400_BAD_REQUEST)
 
-    grant, created = AlbumGrant.objects.get_or_create(grantor=me, grantee=grantee, album=album)
-    if expires_at is not None or created:
-        grant.expires_at = expires_at
-        grant.save(update_fields=['expires_at'])
+    # Each share sets the expiry afresh, so re-sharing an expired album works.
+    grant, _ = AlbumGrant.objects.get_or_create(grantor=me, grantee=grantee, album=album)
+    grant.expires_at = expires_at
+    grant.save(update_fields=['expires_at'])
+    _refresh_share_messages(Message.KIND_ALBUM, [grant.pk])
+
+    # The share appears in their chat, like sending the photos.
+    conv, _ = Conversation.get_or_create_between(me, grantee)
+    msg = Message.objects.create(
+        conversation=conv, sender=me, sender_user=request.user, kind=Message.KIND_ALBUM,
+        metadata={'grant_id': grant.pk, 'name': album.name,
+                  'expires_at': expires_at.isoformat() if expires_at else None},
+    )
+    _deliver_sent(msg, me)
     return Response(AlbumGrantSerializer(grant).data, status=status.HTTP_201_CREATED)
 
 
@@ -1142,7 +1167,14 @@ def album_grant_delete(request, pk):
     deleted, _ = AlbumGrant.objects.filter(pk=pk, grantor__user=request.user).delete()
     if not deleted:
         return Response(status=status.HTTP_404_NOT_FOUND)
+    _refresh_share_messages(Message.KIND_ALBUM, [pk])
     return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+def _refresh_share_messages(kind, grant_ids):
+    """Re-send the chat messages announcing these grants, whose content changes with them."""
+    for msg in Message.objects.filter(kind=kind, metadata__grant_id__in=list(grant_ids), deleted_at__isnull=True):
+        _broadcast_message('message.updated', msg)
 
 
 # ── Discover & profiles ───────────────────────────────────────────────────────
@@ -1422,6 +1454,9 @@ def location_grants(request):
             qs = qs.filter(grantee_id=grantee_id)
         return Response(LocationShareGrantSerializer(qs, many=True).data)
 
+    locked = _locked_group_response(me)
+    if locked:
+        return locked
     if not request.user.has_tier(User.TIER_PLUS):
         return Response(
             {'error': 'Location sharing with specific people requires a Plus subscription.',
@@ -1442,15 +1477,38 @@ def location_grants(request):
         return Response({'error': 'level must be 1 or 2.'}, status=status.HTTP_400_BAD_REQUEST)
 
     expires_at = request.data.get('expires_at')
+    if expires_at is not None:
+        expires_at = parse_datetime(str(expires_at))
+        if expires_at is None:
+            return Response({'error': 'expires_at must be an ISO datetime or null.'}, status=status.HTTP_400_BAD_REQUEST)
+    expires_iso = expires_at.isoformat() if expires_at else None
 
     grant, created = LocationShareGrant.objects.get_or_create(
         grantor=me, grantee=grantee,
         defaults={'level': level, 'expires_at': expires_at},
     )
+    was_active = not created and grant.is_active()
     if not created:
         grant.level = level
         grant.expires_at = expires_at
         grant.save(update_fields=['level', 'expires_at'])
+
+    if was_active:
+        # Changing a live share updates the message already in the chat.
+        for msg in Message.objects.filter(kind=Message.KIND_LIVE_LOCATION, metadata__grant_id=grant.pk,
+                                          deleted_at__isnull=True):
+            if _share_active(grant, msg.metadata):
+                msg.metadata['expires_at'] = expires_iso
+                msg.save(update_fields=['metadata'])
+                _broadcast_message('message.updated', msg)
+    else:
+        # A new share appears in their chat, and follows me as I move.
+        conv, _ = Conversation.get_or_create_between(me, grantee)
+        msg = Message.objects.create(
+            conversation=conv, sender=me, sender_user=request.user, kind=Message.KIND_LIVE_LOCATION,
+            metadata={'grant_id': grant.pk, 'expires_at': expires_iso},
+        )
+        _deliver_sent(msg, me)
     return Response(LocationShareGrantSerializer(grant).data, status=status.HTTP_201_CREATED)
 
 
@@ -1459,6 +1517,7 @@ def location_grant_delete(request, pk):
     deleted, _ = LocationShareGrant.objects.filter(pk=pk, grantor__user=request.user).delete()
     if not deleted:
         return Response(status=status.HTTP_404_NOT_FOUND)
+    _refresh_share_messages(Message.KIND_LIVE_LOCATION, [pk])
     return Response(status=status.HTTP_204_NO_CONTENT)
 
 
@@ -1762,14 +1821,21 @@ def conversation_messages(request, pk):
         # A concurrent retry with the same client_id won the race.
         return Response(MessageSerializer(Message.objects.get(sender=me, client_id=client_id), context=ctx).data)
 
-    Conversation.objects.filter(pk=conv.pk).update(updated_at=timezone.now())
+    msg = _deliver_sent(msg, me)
+    return Response(MessageSerializer(msg, context=ctx).data, status=status.HTTP_201_CREATED)
+
+
+def _deliver_sent(msg, me):
+    """Bookkeeping and fan-out for a message `me` just sent; returns it reloaded for serializing."""
+    members = ConversationMember.objects.filter(conversation_id=msg.conversation_id)
+    Conversation.objects.filter(pk=msg.conversation_id).update(updated_at=timezone.now())
     # Your own messages are read by you; a new message brings the chat back out of the archive.
-    ConversationMember.objects.filter(pk=member.pk).update(last_read_message=msg, last_delivered_message=msg)
-    conv.members.exclude(pk=member.pk).filter(archived=True).update(archived=False)
+    members.filter(persona=me).update(last_read_message=msg, last_delivered_message=msg)
+    members.exclude(persona=me).filter(archived=True).update(archived=False)
     msg = _message_qs(me).get(pk=msg.pk)
     _broadcast_message('message.new', msg)
     notify_new_message(msg)
-    return Response(MessageSerializer(msg, context=ctx).data, status=status.HTTP_201_CREATED)
+    return msg
 
 
 def _chat_images(request):
@@ -1841,13 +1907,20 @@ def _member_message(request, pk, message_id):
 
 @api_view(['PATCH', 'DELETE'])
 def message_detail(request, pk, message_id):
-    """The sender edits (PATCH body) or unsends (DELETE) a message within Message.EDIT_WINDOW."""
+    """
+    The sender edits (PATCH body) or unsends (DELETE) a message within Message.EDIT_WINDOW.
+    Album and location shares can be unsent any time, which also stops the share.
+    """
     member, msg = _member_message(request, pk, message_id)
     if msg.sender_id != member.persona_id:
         return Response({'error': 'You can only change your own messages.'}, status=status.HTTP_403_FORBIDDEN)
     if msg.deleted_at is not None:
         return Response({'error': 'Message was deleted.'}, status=status.HTTP_400_BAD_REQUEST)
-    if timezone.now() - msg.created_at > Message.EDIT_WINDOW:
+    share_grants = {Message.KIND_ALBUM: AlbumGrant, Message.KIND_LIVE_LOCATION: LocationShareGrant}
+    if request.method == 'DELETE' and msg.kind in share_grants:
+        grant_id = msg.metadata.get('grant_id')
+        share_grants[msg.kind].objects.filter(pk=grant_id, grantor_id=msg.sender_id).delete()
+    elif timezone.now() - msg.created_at > Message.EDIT_WINDOW:
         return Response({'error': 'Messages can only be changed for 15 minutes.'}, status=status.HTTP_403_FORBIDDEN)
 
     if request.method == 'DELETE':
@@ -1869,6 +1942,9 @@ def message_detail(request, pk, message_id):
 
     msg = _message_qs(member.persona).get(pk=msg.pk)
     _broadcast_message('message.updated', msg)
+    if msg.kind in share_grants and grant_id is not None:
+        # Earlier messages for the same share now show it stopped.
+        _refresh_share_messages(msg.kind, [grant_id])
     return Response(MessageSerializer(msg, context={'viewer_persona_id': member.persona_id}).data)
 
 

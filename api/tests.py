@@ -651,6 +651,62 @@ class AlbumGrantTests(PersonaTestCase):
         self.as_user(self.bob)
         self.assertEqual(self.gallery_ids(), [self.public.pk])
 
+    def share(self, **extra):
+        self.as_user(self.alice)
+        return self.client.post(
+            '/api/album-grants/', {'album_id': self.album.pk, 'grantee_id': self.bob_main.pk, **extra}, format='json',
+        )
+
+    def album_messages(self):
+        self.as_user(self.bob)
+        conv = Conversation.objects.filter(participants=self.alice_main).get(participants=self.bob_main)
+        res = self.client.get(f'/api/conversations/{conv.pk}/messages/')
+        return [m for m in res.data if m['kind'] == 'album']
+
+    def test_share_posts_album_message_with_photos(self):
+        self.assertEqual(self.share().status_code, 201)
+        [msg] = self.album_messages()
+        self.assertEqual(msg['sender_id'], self.alice_main.pk)
+        self.assertEqual(msg['album'], {'name': 'Private', 'expires_at': None, 'active': True})
+        self.assertEqual([a['id'] for a in msg['attachments']], [self.private.pk])
+
+    def test_revoked_share_message_shows_no_photos(self):
+        grant_id = self.share().data['id']
+        self.client.delete(f'/api/album-grants/{grant_id}/')
+        [msg] = self.album_messages()
+        self.assertFalse(msg['album']['active'])
+        self.assertEqual(msg['attachments'], [])
+
+    def test_expired_share_message_shows_no_photos(self):
+        self.share(expires_at=(timezone.now() + timedelta(hours=1)).isoformat())
+        AlbumGrant.objects.update(expires_at=timezone.now() - timedelta(minutes=1))
+        [msg] = self.album_messages()
+        self.assertFalse(msg['album']['active'])
+        self.assertEqual(msg['attachments'], [])
+
+    def test_reshare_renews_grant_but_not_earlier_messages(self):
+        self.share(expires_at=(timezone.now() + timedelta(hours=1)).isoformat())
+        first = Message.objects.get(kind='album')
+        first.metadata['expires_at'] = (timezone.now() - timedelta(minutes=1)).isoformat()
+        first.save()
+        AlbumGrant.objects.update(expires_at=timezone.now() - timedelta(minutes=1))
+
+        self.share()
+        self.assertIsNone(AlbumGrant.objects.get().expires_at)
+        old, new = self.album_messages()
+        self.assertFalse(old['album']['active'])
+        self.assertTrue(new['album']['active'])
+
+    def test_unsending_share_stops_it_even_after_edit_window(self):
+        self.share()
+        msg = Message.objects.get(kind='album')
+        Message.objects.filter(pk=msg.pk).update(created_at=timezone.now() - timedelta(days=1))
+        res = self.client.delete(f'/api/conversations/{msg.conversation_id}/messages/{msg.pk}/')
+        self.assertEqual(res.status_code, 200)
+        self.assertFalse(AlbumGrant.objects.exists())
+        self.as_user(self.bob)
+        self.assertEqual(self.gallery_ids(), [self.public.pk])
+
     def test_persona_photos_must_come_from_own_library(self):
         bob_img = ProfileImage.objects.create(user=self.bob, image='gallery/bob.jpg')
         self.as_user(self.alice)
@@ -659,6 +715,84 @@ class AlbumGrantTests(PersonaTestCase):
         res = self.client.put(url, {'image_ids': [self.private.pk, self.public.pk]}, format='json')
         self.assertEqual(res.status_code, 200)
         self.assertEqual([g['id'] for g in res.data['gallery_images']], [self.private.pk, self.public.pk])
+
+
+class LocationShareMessageTests(PersonaTestCase):
+    def setUp(self):
+        super().setUp()
+        self.alice.subscription_tier = User.TIER_PLUS
+        self.alice.latitude, self.alice.longitude = 39.1, -84.5
+        self.alice.save()
+
+    def share(self, level=2, **extra):
+        self.as_user(self.alice)
+        return self.client.post(
+            '/api/location-grants/', {'grantee_id': self.bob_main.pk, 'level': level, **extra}, format='json',
+        )
+
+    def location_messages(self):
+        self.as_user(self.bob)
+        conv = Conversation.objects.filter(participants=self.alice_main).get(participants=self.bob_main)
+        res = self.client.get(f'/api/conversations/{conv.pk}/messages/')
+        return [m for m in res.data if m['kind'] == 'live_location']
+
+    def test_share_posts_message_that_follows_the_sharer(self):
+        self.assertEqual(self.share().status_code, 201)
+        [msg] = self.location_messages()
+        self.assertTrue(msg['location']['active'])
+        self.assertEqual((msg['location']['latitude'], msg['location']['longitude']), (39.1, -84.5))
+
+        self.as_user(self.alice)
+        self.client.patch('/api/me/', {'latitude': 39.2, 'longitude': -84.6}, format='json')
+        [msg] = self.location_messages()
+        self.assertEqual((msg['location']['latitude'], msg['location']['longitude']), (39.2, -84.6))
+        self.assertIsNotNone(msg['location']['located_at'])
+
+    def test_general_level_is_fuzzed(self):
+        self.share(level=1)
+        [msg] = self.location_messages()
+        self.assertEqual(msg['location']['level'], 1)
+        self.assertNotEqual((msg['location']['latitude'], msg['location']['longitude']), (39.1, -84.5))
+
+    def test_changing_a_live_share_updates_its_message(self):
+        self.share(level=1)
+        self.share(level=2)
+        [msg] = self.location_messages()
+        self.assertEqual(msg['location']['level'], 2)
+
+    def test_revoked_share_hides_location(self):
+        grant_id = self.share().data['id']
+        self.client.delete(f'/api/location-grants/{grant_id}/')
+        [msg] = self.location_messages()
+        self.assertFalse(msg['location']['active'])
+        self.assertIsNone(msg['location']['latitude'])
+
+    def test_upload_reports_whether_location_is_shared(self):
+        self.as_user(self.alice)
+        res = self.client.patch('/api/me/', {'latitude': 39.2, 'longitude': -84.6}, format='json')
+        self.assertFalse(res.data['sharing_location'])
+        self.share()
+        res = self.client.patch('/api/me/', {'latitude': 39.2, 'longitude': -84.6}, format='json')
+        self.assertTrue(res.data['sharing_location'])
+
+    def test_unsending_share_stops_it(self):
+        self.share()
+        msg = Message.objects.get(kind='live_location')
+        self.as_user(self.alice)
+        self.client.delete(f'/api/conversations/{msg.conversation_id}/messages/{msg.pk}/')
+        self.assertFalse(LocationShareGrant.objects.exists())
+
+    def test_resharing_after_expiry_posts_a_new_message(self):
+        self.share(expires_at=(timezone.now() + timedelta(hours=1)).isoformat())
+        LocationShareGrant.objects.update(expires_at=timezone.now() - timedelta(minutes=1))
+        Message.objects.filter(kind='live_location').update(
+            metadata={'grant_id': LocationShareGrant.objects.get().pk,
+                      'expires_at': (timezone.now() - timedelta(minutes=1)).isoformat()},
+        )
+        self.share()
+        old, new = self.location_messages()
+        self.assertFalse(old['location']['active'])
+        self.assertTrue(new['location']['active'])
 
 
 class MessagingTestCase(PersonaTestCase):

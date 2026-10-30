@@ -1,6 +1,9 @@
+import mimetypes
+
 import phonenumbers
 from django.db.models import Q
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from rest_framework import serializers
 from .models import User, Persona, PersonaMember, ProfileImage, Album, AlbumGrant, Conversation, Message, LocationShareGrant, FaceVerification, Lifeline, Friend
 from . import discover
@@ -430,6 +433,12 @@ def _member_name(persona_id: int, user_id: int) -> str:
     return shown.display_name if shown is not None else 'A member'
 
 
+def _share_active(grant, metadata) -> bool:
+    """A share's chat message is live while its grant exists and neither the grant nor the message has expired."""
+    expires = parse_datetime(metadata['expires_at']) if metadata.get('expires_at') else None
+    return grant is not None and grant.is_active() and (expires is None or timezone.now() < expires)
+
+
 class MessageSerializer(serializers.ModelSerializer):
     """Context: `viewer_persona_id` — only when it's the sending group does `sent_by` say which member wrote it."""
     sender_id = serializers.IntegerField(read_only=True)
@@ -438,13 +447,31 @@ class MessageSerializer(serializers.ModelSerializer):
     reactions = serializers.SerializerMethodField()
     attachments = serializers.SerializerMethodField()
     sent_by = serializers.SerializerMethodField()
+    album = serializers.SerializerMethodField()
+    location = serializers.SerializerMethodField()
 
     class Meta:
         model = Message
         fields = [
             'id', 'conversation_id', 'sender_id', 'client_id', 'kind', 'body', 'metadata',
-            'reply_to', 'reactions', 'attachments', 'created_at', 'edited_at', 'deleted_at', 'sent_by',
+            'reply_to', 'reactions', 'attachments', 'created_at', 'edited_at', 'deleted_at', 'sent_by', 'album',
+            'location',
         ]
+
+    def _album_share(self, obj):
+        """(grant, active) for an album message: active while its grant exists and neither it nor this share has expired."""
+        if not hasattr(self, '_shares'):
+            self._shares = {}
+        if obj.pk not in self._shares:
+            grant = AlbumGrant.objects.select_related('album').filter(pk=obj.metadata.get('grant_id')).first()
+            self._shares[obj.pk] = (grant, _share_active(grant, obj.metadata))
+        return self._shares[obj.pk]
+
+    def get_album(self, obj):
+        if obj.kind != Message.KIND_ALBUM or obj.deleted_at is not None:
+            return None
+        _, active = self._album_share(obj)
+        return {'name': obj.metadata.get('name', ''), 'expires_at': obj.metadata.get('expires_at'), 'active': active}
 
     def get_sent_by(self, obj):
         if obj.sender_id != self.context.get('viewer_persona_id') or obj.sender_user_id is None:
@@ -457,7 +484,44 @@ class MessageSerializer(serializers.ModelSerializer):
             self._names[obj.sender_user_id] = _member_name(obj.sender_id, obj.sender_user_id)
         return self._names[obj.sender_user_id]
 
+    def get_location(self, obj):
+        """The sharer's current location at the shared level, only while the share is active."""
+        if obj.kind != Message.KIND_LIVE_LOCATION or obj.deleted_at is not None:
+            return None
+        grant = (
+            LocationShareGrant.objects.select_related('grantor__user', 'grantor__last_active_user')
+            .filter(pk=obj.metadata.get('grant_id')).first()
+        )
+        active = _share_active(grant, obj.metadata)
+        data = {'level': None, 'expires_at': obj.metadata.get('expires_at'), 'active': active,
+                'latitude': None, 'longitude': None, 'located_at': None}
+        if active:
+            persona = grant.grantor
+            user = (persona.last_active_user or persona.user) if persona.group_type else persona.user
+            # Groups never share more precisely than General (see _location_at_level).
+            data['level'] = min(grant.level, 1) if persona.group_type else grant.level
+            data['latitude'] = _location_at_level(persona, grant.level, 0)
+            data['longitude'] = _location_at_level(persona, grant.level, 1)
+            if data['latitude'] is not None and user.location_updated_at is not None:
+                data['located_at'] = user.location_updated_at.isoformat()
+        return data
+
     def get_attachments(self, obj):
+        if obj.kind == Message.KIND_ALBUM:
+            # The album's current photos, only while the share is active.
+            grant, active = self._album_share(obj)
+            if not active:
+                return []
+            return [{
+                'id': img.id,
+                'mime': mimetypes.guess_type(img.image.name)[0] or '',
+                'url': img.image.url,
+                'width': None,
+                'height': None,
+                'explicit': img.tag_explicit,
+                'view_once': False,
+                'viewed': False,
+            } for img in grant.album.images.all()]
         # View-once photos never get a URL; they're fetched once through attachment_view.
         return [{
             'id': a.id,

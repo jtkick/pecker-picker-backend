@@ -399,6 +399,8 @@ class ConversationMember(models.Model):
 class Message(models.Model):
     KIND_TEXT = 'text'
     KIND_IMAGE = 'image'
+    KIND_ALBUM = 'album'
+    KIND_LIVE_LOCATION = 'live_location'
     KIND_CHOICES = [
         (KIND_TEXT, 'Text'),
         ('image', 'Image'),
