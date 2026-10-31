@@ -228,12 +228,18 @@ def shown_age(persona):
     return persona.user.age if persona.show_age and not persona.group_type else None
 
 
+def _ages(persona) -> list[int]:
+    """Ages that can match an age filter: a group's from its members' person cards."""
+    if not persona.group_type:
+        age = shown_age(persona)
+        return [] if age is None else [age]
+    return [m.age for m in persona.group_members.all() if m.status == 'accepted' and m.age is not None]
+
+
 def _passes(candidate, filters, now, verified: bool) -> bool:
-    if not candidate.group_type:
-        age = shown_age(candidate)
-        if 'age_min' in filters and (age is None or age < filters['age_min']):
-            return False
-        if 'age_max' in filters and (age is None or age > filters['age_max']):
+    if 'age_min' in filters or 'age_max' in filters:
+        low, high = filters.get('age_min', 0), filters.get('age_max', 999)
+        if not any(low <= age <= high for age in _ages(candidate)):
             return False
     if filters.get('looking_for') and not set(filters['looking_for']) & set(candidate.relationship_types or ()):
         return False

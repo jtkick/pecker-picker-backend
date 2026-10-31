@@ -277,23 +277,18 @@ class DiscoverPersonaSerializer(serializers.ModelSerializer):
         return self.context.get('ranks', {}).get(obj.pk)
 
     def get_members(self, obj):
-        """For a group, each member with only what that member chose to share."""
+        """For a group, each member's person card, leaving out blank values."""
         if not obj.group_type:
             return []
-        request = self.context.get('request')
         result = []
         for m in _accepted_members(obj):
             entry = {'is_verified': _is_verified(m.user)}
-            rep = m.represent_persona
-            if m.share_profile and rep is not None:
-                entry['display_name'] = rep.display_name
-                entry['profile_picture'] = _first_photo_url(rep, request)
-            if m.share_pronouns and m.user.pronouns:
-                entry['pronouns'] = m.user.pronouns
-            if m.share_height and m.user.height is not None:
-                entry['height'] = m.user.height
-            if m.share_length and m.user.length is not None:
-                entry['length'] = m.user.length
+            if m.name:
+                entry['display_name'] = m.name
+            for name in ('age', 'pronouns', 'height', 'length'):
+                value = getattr(m, name)
+                if value not in (None, ''):
+                    entry[name] = value
             result.append(entry)
         return result
 
@@ -304,7 +299,7 @@ class DiscoverPersonaSerializer(serializers.ModelSerializer):
         return None if obj.is_side else obj.position
 
     # Account-wide values, shown only where the persona opts in.
-    # Groups show these per member instead (see get_members).
+    # Groups show these on each member's card instead (see get_members).
     def get_age(self, obj):
         return discover.shown_age(obj)
 
@@ -417,20 +412,17 @@ class LifelineSerializer(serializers.ModelSerializer):
         return [{'id': p.pk, 'display_name': p.display_name} for p in obj.recipients.all()]
 
 
-def _shown_as(member: PersonaMember) -> Persona | None:
-    """The persona a group member appears as to the rest of their group."""
-    if member.status == PersonaMember.STATUS_ACCEPTED and member.represent_persona is not None:
-        return member.represent_persona
-    return member.invited_as
-
-
 def _member_name(persona_id: int, user_id: int) -> str:
+    """Who in a group sent a message: their card name, else the profile they were invited as."""
     member = (
         PersonaMember.objects.filter(persona_id=persona_id, user_id=user_id)
-        .select_related('represent_persona', 'invited_as').first()
+        .select_related('invited_as').first()
     )
-    shown = _shown_as(member) if member is not None else None
-    return shown.display_name if shown is not None else 'A member'
+    if member is None:
+        return 'A member'
+    if member.name:
+        return member.name
+    return member.invited_as.display_name if member.invited_as else 'A member'
 
 
 def _share_active(grant, metadata) -> bool:
@@ -632,7 +624,7 @@ class ConversationSerializer(serializers.ModelSerializer):
 
 
 class GroupMemberSerializer(serializers.ModelSerializer):
-    """A group member as the group's own members see them. Share flags are shown only to that member."""
+    """A group member as the group's own members see them: who the account is, plus their person card."""
     is_me = serializers.SerializerMethodField()
     display_name = serializers.SerializerMethodField()
     profile_picture = serializers.SerializerMethodField()
@@ -641,26 +633,17 @@ class GroupMemberSerializer(serializers.ModelSerializer):
         model = PersonaMember
         fields = [
             'id', 'role', 'status', 'can_edit', 'is_me', 'display_name', 'profile_picture',
-            'represent_persona_id', *PersonaMember.SHARE_FIELDS,
+            *PersonaMember.CARD_FIELDS,
         ]
 
     def get_is_me(self, obj):
         return obj.user_id == self.context['request'].user.pk
 
     def get_display_name(self, obj):
-        persona = _shown_as(obj)
-        return persona.display_name if persona else 'A member'
+        return obj.invited_as.display_name if obj.invited_as else 'A member'
 
     def get_profile_picture(self, obj):
-        persona = _shown_as(obj)
-        return _first_photo_url(persona, self.context['request']) if persona else None
-
-    def to_representation(self, obj):
-        data = super().to_representation(obj)
-        if not data['is_me']:
-            for name in PersonaMember.SHARE_FIELDS + ['represent_persona_id']:
-                data.pop(name)
-        return data
+        return _first_photo_url(obj.invited_as, self.context['request']) if obj.invited_as else None
 
 
 class InvitationSerializer(serializers.ModelSerializer):

@@ -164,14 +164,16 @@ class GroupPersonaTests(PersonaTestCase):
         self.as_user(as_user or self.alice)
         return self.client.post(f'/api/personas/{self.group.pk}/members/', {'persona_id': persona.pk})
 
-    def join_bob(self, **share):
+    def join_bob(self):
         self.assertEqual(self.invite(self.bob_main).status_code, 201)
         self.as_user(self.bob)
         invitation = self.client.get('/api/invitations/').data[0]
-        res = self.client.post(f'/api/invitations/{invitation["id"]}/accept/',
-                               {'represent_persona_id': self.bob_main.pk, **share}, format='json')
+        res = self.client.post(f'/api/invitations/{invitation["id"]}/accept/')
         self.assertEqual(res.status_code, 200)
         return PersonaMember.objects.get(persona=self.group, user=self.bob)
+
+    def card_url(self, member):
+        return f'/api/personas/{self.group.pk}/members/{member.pk}/'
 
     def listing(self, user):
         self.as_user(user)
@@ -193,22 +195,33 @@ class GroupPersonaTests(PersonaTestCase):
         self.assertEqual(self.client.post('/api/personas/', {'display_name': 'Bob alt'}).status_code, 201)
         self.assertEqual(self.client.post(f'/api/personas/{self.group.pk}/activate/').status_code, 200)
 
-    def test_edit_rights_and_share_flags(self):
+    def test_edit_rights_cover_every_person_card(self):
         member = self.join_bob()
-        url = f'/api/personas/{self.group.pk}/members/{member.pk}/'
+        owner = PersonaMember.objects.get(persona=self.group, user=self.alice)
+        url = self.card_url(member)
         self.as_user(self.bob)
         self.assertEqual(self.client.patch(f'/api/personas/{self.group.pk}/', {'bio': 'x'}).status_code, 403)
         self.assertEqual(self.client.patch(url, {'can_edit': True}, format='json').status_code, 403)
+        self.assertEqual(self.client.patch(url, {'name': 'Bob'}, format='json').status_code, 403)
         self.as_user(self.alice)
-        self.assertEqual(self.client.patch(url, {'share_height': True}, format='json').status_code, 403)
+        self.assertEqual(self.client.patch(url, {'name': ' Bobby ', 'age': 31}, format='json').status_code, 200)
         self.assertEqual(self.client.patch(url, {'can_edit': True}, format='json').status_code, 200)
         self.as_user(self.bob)
         self.assertEqual(self.client.patch(f'/api/personas/{self.group.pk}/', {'bio': 'x'}).status_code, 200)
-        self.assertEqual(self.client.patch(url, {'share_height': True}, format='json').status_code, 200)
+        res = self.client.patch(self.card_url(owner), {'pronouns': 'she/her', 'height': 170}, format='json')
+        self.assertEqual((res.status_code, res.data['pronouns'], res.data['height']), (200, 'she/her', 170))
+        for bad in ({'age': 17}, {'height': 300}, {'length': -1}, {'age': '30'}, {'name': 'x' * 51}):
+            self.assertEqual(self.client.patch(url, bad, format='json').status_code, 400, bad)
+        self.assertEqual(self.client.patch(url, {'share_height': True}, format='json').status_code, 200)  # old apps
+        self.assertEqual(self.client.patch(url, {'age': None}, format='json').status_code, 200)
+        member.refresh_from_db()
+        self.assertEqual((member.name, member.age), ('Bobby', None))
         self.assertEqual(self.client.delete(f'/api/personas/{self.group.pk}/').status_code, 403)
 
-    def test_discover_shows_only_shared_member_info_at_active_members_location(self):
-        self.join_bob(share_profile=True, share_pronouns=True)
+    def test_discover_shows_person_cards_at_active_members_location(self):
+        member = self.join_bob()
+        member.name, member.pronouns, member.age = 'Bobby', 'they/them', 30
+        member.save()
         self.group.location_sharing = 2   # capped to General for groups
         self.group.save()
         self.as_user(self.bob)
@@ -218,13 +231,33 @@ class GroupPersonaTests(PersonaTestCase):
         self.assertIn(self.alice_main.pk, profiles)   # Alice still uses her own profile
         group = profiles[self.group.pk]
         self.assertEqual(group['member_count'], 2)
-        self.assertIn({'is_verified': False}, group['members'])   # Alice shares nothing by default
+        self.assertIn({'is_verified': False}, group['members'])   # Alice's card is still blank
         bob = next(m for m in group['members'] if 'display_name' in m)
-        self.assertEqual(bob['display_name'], 'Bob')
-        self.assertEqual(bob['pronouns'], 'he/him')
-        self.assertNotIn('height', bob)
+        self.assertEqual((bob['display_name'], bob['pronouns'], bob['age']), ('Bobby', 'they/them', 30))
+        self.assertNotIn('height', bob)   # nothing comes from Bob's account
         self.assertNotEqual(group['latitude'], 39.3)
         self.assertAlmostEqual(group['latitude'], 39.3, delta=0.005)
+
+    def test_age_filter_matches_any_person_in_the_group(self):
+        member = self.join_bob()
+        self.as_user(self.bob)
+        self.client.post(f'/api/personas/{self.group.pk}/activate/')
+        self.carol_main.discover_filters = {'age_min': 30, 'age_max': 40}
+        self.carol_main.save()
+
+        def shown():
+            cache.clear()
+            self.as_user(self.carol)
+            return self.group.pk in [p['id'] for p in self.client.get('/api/discover/').data['results']]
+
+        self.assertFalse(shown())   # no ages set
+        owner = PersonaMember.objects.get(persona=self.group, user=self.alice)
+        owner.age = 25
+        owner.save()
+        self.assertFalse(shown())
+        member.age = 35
+        member.save()
+        self.assertTrue(shown())
 
     def test_messages_reach_all_members_and_only_they_see_who_sent(self):
         self.join_bob()
@@ -1556,3 +1589,35 @@ class AreaTests(PersonaTestCase):
         self.assertEqual(self.client.get('/api/discover/map/', {'bbox': bbox, 'group': 'city'}).status_code, 400)
         # Without `group`, older apps still get a plain list.
         self.assertIsInstance(self.client.get('/api/discover/map/', {'bbox': bbox}).data, list)
+
+
+class GroupCardMigrationTests(APITransactionTestCase):
+    """0044–0045 seed person cards from what each member used to share."""
+    before, after = [('api', '0043_friend_profileview')], [('api', '0045_remove_group_share_fields')]
+
+    def test_cards_hold_only_what_was_shared(self):
+        from django.db import connection
+        from django.db.migrations.executor import MigrationExecutor
+        executor = MigrationExecutor(connection)
+        executor.migrate(self.before)
+        try:
+            apps = executor.loader.project_state(self.before).apps
+            User_, Persona_, Member = (apps.get_model('api', n) for n in ('User', 'Persona', 'PersonaMember'))
+            alice = User_.objects.create(phone_number='+15550100201', pronouns='she/her', height=165)
+            bob = User_.objects.create(phone_number='+15550100202', pronouns='he/him', height=180, length=60)
+            alice_main = Persona_.objects.create(user=alice, display_name='Alice', is_primary=True)
+            bob_main = Persona_.objects.create(user=bob, display_name='Bob', is_primary=True)
+            group = Persona_.objects.create(user=alice, display_name='A+B', group_type='couple')
+            Member.objects.create(persona=group, user=alice, role='owner', status='accepted',
+                                  represent_persona=alice_main)
+            Member.objects.create(persona=group, user=bob, status='accepted', invited_as=bob_main,
+                                  represent_persona=bob_main, share_profile=True, share_height=True)
+            executor = MigrationExecutor(connection)
+            executor.migrate(self.after)
+        finally:
+            executor = MigrationExecutor(connection)
+            executor.migrate(executor.loader.graph.leaf_nodes())
+        owner = PersonaMember.objects.get(user_id=alice.pk)
+        member = PersonaMember.objects.get(user_id=bob.pk)
+        self.assertEqual((owner.name, owner.pronouns, owner.height, owner.invited_as_id), ('', '', None, alice_main.pk))
+        self.assertEqual((member.name, member.pronouns, member.height, member.length), ('Bob', '', 180, None))

@@ -574,10 +574,10 @@ def _photos_prefetch():
 
 
 def _group_members_prefetch():
-    """Accepted group members with what's needed to show their shared info."""
+    """Accepted group members with what's needed to show their person cards."""
     return Prefetch('group_members', queryset=PersonaMember.objects.filter(status=ACCEPTED).select_related(
-        'user', 'user__verification', 'represent_persona',
-    ).prefetch_related(Prefetch('represent_persona__photos', queryset=PersonaPhoto.objects.select_related('image'))))
+        'user', 'user__verification',
+    ))
 
 
 def _persona_qs():
@@ -734,7 +734,7 @@ def personas(request):
             PersonaMember.objects.create(
                 persona=persona, user=user, role=PersonaMember.ROLE_OWNER, status=ACCEPTED,
                 can_edit=True, responded_at=timezone.now(),
-                represent_persona=user.personas.filter(is_primary=True).first(),
+                invited_as=user.personas.filter(is_primary=True).first(),
             )
     ctx['unlocked_ids'] = user.unlocked_persona_ids()
     return Response(PersonaSerializer(persona, context=ctx).data, status=status.HTTP_201_CREATED)
@@ -850,11 +850,8 @@ def persona_members(request, pk):
         if persona.user_id != request.user.pk:
             members = members.exclude(status=PersonaMember.STATUS_DECLINED)
         members = (
-            members.select_related('user', 'represent_persona', 'invited_as')
-            .prefetch_related(
-                Prefetch('represent_persona__photos', queryset=PersonaPhoto.objects.select_related('image')),
-                Prefetch('invited_as__photos', queryset=PersonaPhoto.objects.select_related('image')),
-            )
+            members.select_related('user', 'invited_as')
+            .prefetch_related(Prefetch('invited_as__photos', queryset=PersonaPhoto.objects.select_related('image')))
         )
         return Response(GroupMemberSerializer(members, many=True, context={'request': request}).data)
 
@@ -896,7 +893,8 @@ def persona_member_detail(request, pk, member_id):
     persona, err = _my_persona(request, pk)
     if err:
         return err
-    member = get_object_or_404(PersonaMember.objects.filter(persona=persona).select_related('user', 'persona'), pk=member_id)
+    member = get_object_or_404(PersonaMember.objects.filter(persona=persona).select_related('user', 'persona', 'invited_as'),
+                               pk=member_id)
     is_owner = persona.user_id == request.user.pk
     is_self = member.user_id == request.user.pk
 
@@ -909,9 +907,23 @@ def persona_member_detail(request, pk, member_id):
         _leave_group(member)
         return Response(status=status.HTTP_204_NO_CONTENT)
 
-    # PATCH — the owner sets edit rights; each member sets what of themself is shared.
+    # PATCH — the owner sets edit rights; editors fill in person cards. Old apps' share flags are ignored.
     data = request.data
     fields = []
+    card = [f for f in PersonaMember.CARD_FIELDS if f in data]
+    if card:
+        if not is_editor(request.user, persona):
+            return Response({'error': 'Only members allowed to edit can change this profile.'},
+                            status=status.HTTP_403_FORBIDDEN)
+        locked = _locked_group_response(persona)
+        if locked:
+            return locked
+        if member.status != ACCEPTED:
+            return Response({'error': 'They haven\'t joined yet.'}, status=status.HTTP_400_BAD_REQUEST)
+        err = _apply_card(member, data)
+        if err:
+            return err
+        fields += card
     if 'can_edit' in data:
         if not is_owner or member.role == PersonaMember.ROLE_OWNER:
             return Response({'error': 'Only the owner sets who can edit.'}, status=status.HTTP_403_FORBIDDEN)
@@ -919,30 +931,33 @@ def persona_member_detail(request, pk, member_id):
             return Response({'error': 'can_edit must be a boolean.'}, status=status.HTTP_400_BAD_REQUEST)
         member.can_edit = data['can_edit']
         fields.append('can_edit')
-    personal = [f for f in PersonaMember.SHARE_FIELDS + ['represent_persona_id'] if f in data]
-    if personal and not is_self:
-        return Response({'error': 'Only that member can change what they share.'}, status=status.HTTP_403_FORBIDDEN)
-    err = _apply_personal(member, data)
-    if err:
-        return err
-    member.save(update_fields=fields + [f.removesuffix('_id') for f in personal])
-    _notify_group(persona.pk)
+    if fields:
+        member.save(update_fields=fields)
+        _notify_group(persona.pk)
     return Response(GroupMemberSerializer(member, context={'request': request}).data)
 
 
-def _apply_personal(member, data):
-    """Set the member's own share flags / represent persona from `data`; returns an error response or None."""
-    for name in PersonaMember.SHARE_FIELDS:
+# Allowed ranges for person-card numbers, matching the app's sliders.
+_CARD_RANGES = {'age': (18, 99), 'height': (121, 220), 'length': (0, 120)}
+
+
+def _apply_card(member, data):
+    """Set person-card fields from `data`; returns an error response or None."""
+    for name in ('name', 'pronouns'):
         if name in data:
-            if not isinstance(data[name], bool):
-                return Response({'error': f'{name} must be a boolean.'}, status=status.HTTP_400_BAD_REQUEST)
-            setattr(member, name, data[name])
-    if 'represent_persona_id' in data:
-        rep_id = data['represent_persona_id']
-        rep = None if rep_id is None else member.user.personas.filter(pk=rep_id, group_type='').first()
-        if rep_id is not None and rep is None:
-            return Response({'error': 'Choose one of your own profiles.'}, status=status.HTTP_400_BAD_REQUEST)
-        member.represent_persona = rep
+            value = data[name] if data[name] is not None else ''
+            limit = PersonaMember._meta.get_field(name).max_length
+            if not isinstance(value, str) or len(value.strip()) > limit:
+                return Response({'error': f'{name} must be text up to {limit} characters.'},
+                                status=status.HTTP_400_BAD_REQUEST)
+            setattr(member, name, value.strip())
+    for name, (low, high) in _CARD_RANGES.items():
+        if name in data:
+            value = data[name]
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high):
+                return Response({'error': f'{name} must be between {low} and {high}.'},
+                                status=status.HTTP_400_BAD_REQUEST)
+            setattr(member, name, value)
     return None
 
 
@@ -965,7 +980,7 @@ def invitations(request):
 
 @api_view(["POST"])
 def invitation_respond(request, pk, action):
-    """Accept (with `represent_persona_id` and share flags) or decline. Any tier may join."""
+    """Accept or decline. Any tier may join."""
     if action not in ('accept', 'decline'):
         return Response(status=status.HTTP_404_NOT_FOUND)
     member = get_object_or_404(_invitations_qs(request.user).select_related('user'), pk=pk)
@@ -981,9 +996,6 @@ def invitation_respond(request, pk, action):
         Q(blocker=request.user, blocked__in=member_ids) | Q(blocker__in=member_ids, blocked=request.user)
     ).exists():
         return Response({'error': 'This invitation is no longer available.'}, status=status.HTTP_404_NOT_FOUND)
-    err = _apply_personal(member, request.data)
-    if err:
-        return err
     member.status = ACCEPTED
     member.responded_at = timezone.now()
     member.save()

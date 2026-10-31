@@ -242,7 +242,8 @@ class ProfileView(models.Model):
 class PersonaMember(models.Model):
     """
     An account in a group persona. The owner has a row too. Only the owner sets
-    `can_edit`; only the member themself sets what of their own info is shared.
+    `can_edit`; any editor fills in each member's person card, which is all the
+    group shows about them.
     """
     ROLE_OWNER, ROLE_MEMBER = 'owner', 'member'
     STATUS_INVITED, STATUS_ACCEPTED, STATUS_DECLINED = 'invited', 'accepted', 'declined'
@@ -255,20 +256,20 @@ class PersonaMember(models.Model):
     invited_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name='+')
     # The inviter's persona at the time — what the invitee knows them as.
     invited_via = models.ForeignKey(Persona, null=True, blank=True, on_delete=models.SET_NULL, related_name='+')
-    # The invitee's persona the owner invited — how the group knows them until they pick `represent_persona`.
+    # The invitee's persona the owner invited (the owner's own when they created it) — how the group knows them.
     invited_as = models.ForeignKey(Persona, null=True, blank=True, on_delete=models.SET_NULL, related_name='+')
     created_at = models.DateTimeField(auto_now_add=True)
     responded_at = models.DateTimeField(null=True, blank=True)
 
     can_edit = models.BooleanField(default=False)
-    # One of the member's own solo personas that stands for them (name + first photo).
-    represent_persona = models.ForeignKey(Persona, null=True, blank=True, on_delete=models.SET_NULL, related_name='+')
-    share_profile = models.BooleanField(default=False)
-    share_pronouns = models.BooleanField(default=False)
-    share_height = models.BooleanField(default=False)
-    share_length = models.BooleanField(default=False)
+    # The member's person card on the group profile; blank values aren't shown.
+    name = models.CharField(max_length=50, blank=True)
+    age = models.SmallIntegerField(null=True, blank=True)
+    pronouns = models.CharField(max_length=20, blank=True)
+    height = models.SmallIntegerField(null=True, blank=True)   # cm
+    length = models.SmallIntegerField(null=True, blank=True)   # tenths of an inch, 0–120
 
-    SHARE_FIELDS = ['share_profile', 'share_pronouns', 'share_height', 'share_length']
+    CARD_FIELDS = ['name', 'age', 'pronouns', 'height', 'length']
 
     class Meta:
         unique_together = [('persona', 'user')]
