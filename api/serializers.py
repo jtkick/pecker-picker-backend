@@ -134,6 +134,12 @@ class AccountSerializer(serializers.ModelSerializer):
     def get_library_limit(self, obj):
         return obj.library_limit()
 
+    def validate_age(self, value):
+        # Adults only; same range as the app's picker and group person cards.
+        if value is not None and not 18 <= value <= 99:
+            raise serializers.ValidationError('Age must be between 18 and 99.')
+        return value
+
 
 def _accepted_members(persona) -> list[PersonaMember]:
     """Works with or without the views' accepted-only `group_members` prefetch."""

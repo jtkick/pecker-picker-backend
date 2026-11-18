@@ -1443,6 +1443,13 @@ class AccountDeletionTests(PersonaTestCase):
         with self.captureOnCommitCallbacks(execute=True):
             return self.client.delete('/api/me/')
 
+    def test_account_age_must_be_adult(self):
+        self.as_user(self.alice)
+        for bad in (17, 0, 100):
+            self.assertEqual(self.client.patch('/api/me/', {'age': bad}, format='json').status_code, 400)
+        self.assertEqual(self.client.patch('/api/me/', {'age': 18}, format='json').status_code, 200)
+        self.assertEqual(self.client.patch('/api/me/', {'age': None}, format='json').status_code, 200)
+
     def test_deletes_account_conversations_messages_and_files(self):
         files = [self.photo.image.name, self.bob_photo.file.name]
         refresh = RefreshToken.for_user(self.alice)
